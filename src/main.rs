@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use burn::{
     backend::{Autodiff, NdArray},
     config::Config,
@@ -5,6 +7,7 @@ use burn::{
         dataloader::{DataLoaderBuilder, batcher::Batcher},
         dataset::InMemDataset,
     },
+    lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
     nn::{
         Dropout, DropoutConfig, Linear, LinearConfig,
@@ -31,6 +34,7 @@ use mfcc::Transform;
 use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
+    collections::HashMap,
     fs::{File, exists, read_dir, read_to_string, write},
     path::Path,
     path::PathBuf,
@@ -45,8 +49,11 @@ use symphonia::core::meta::MetadataOptions;
 
 use symphonia::core::probe::Hint;
 
+use burn::backend::wgpu::{Wgpu, WgpuDevice, graphics::AutoGraphicsApi, init_setup_async};
+
 // Define our Autodiff backend type
 type MyAutodiffBackend = Autodiff<NdArray>;
+
 // -- 1. Two-Layer Network Module Definition --
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
@@ -106,7 +113,7 @@ const N_COEFFS: usize = 20;
 
 const PART_FOR_TRAINING: f32 = 0.9;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 enum Genre {
     Punk,
     RockNRoll,
@@ -233,7 +240,7 @@ const ITEMS_FILE: &str = "items.json";
 
 static SAMPLE_RATE: OnceLock<u32> = OnceLock::new();
 
-pub fn mfccs_for_audio(path: PathBuf, all_mfccs: &mut Vec<f64>) {
+pub fn mfccs_for_audio(path: &PathBuf, all_mfccs: &mut Vec<f64>) {
     let src = File::open(path).unwrap();
     let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -316,7 +323,7 @@ pub fn get_items(items: &mut Vec<AudioItem>) {
             let audio_path = audio.path();
 
             let mut all_mfccs = Vec::new();
-            mfccs_for_audio(audio_path, &mut all_mfccs);
+            mfccs_for_audio(&audio_path, &mut all_mfccs);
 
             items.push(AudioItem {
                 genre: genre.clone(),
@@ -374,7 +381,9 @@ pub fn train<B: AutodiffBackend>(
         .build(
             config.model.init::<B>(&device),
             config.optimizer.init(),
-            config.learning_rate,
+            CosineAnnealingLrSchedulerConfig::new(config.learning_rate, 50)
+                .init()
+                .unwrap(),
         );
 
     let model_trained = learner.fit(dataloader_train, dataloader_test);
@@ -398,6 +407,8 @@ enum Mode {
 struct TomlConfig {
     mode: Mode,
 }
+
+const ITERATIONS: usize = 50;
 
 pub fn main() {
     let data = read_to_string(CONFIG_FILE).unwrap();
@@ -436,7 +447,7 @@ pub fn main() {
 
             model = model
                 .load_file(
-                    Path::new(ARTIFACT_DIR).join("model"),
+                    Path::new("models").join("model"),
                     &CompactRecorder::new(),
                     &device,
                 )
@@ -447,18 +458,37 @@ pub fn main() {
                 let audio_path = audio.path();
 
                 let mut all_mfccs = Vec::new();
-                mfccs_for_audio(audio_path, &mut all_mfccs);
+                mfccs_for_audio(&audio_path, &mut all_mfccs);
 
+                let mut frequencies = HashMap::with_capacity(ITERATIONS);
                 let data = TensorData::from(all_mfccs.as_slice());
                 let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
                 let tensor = b.reshape([1, -1]);
 
-                let a = model.forward(tensor);
+                for _ in 0..ITERATIONS {
+                    let a = model.forward(tensor.clone());
 
-                let probabilities = softmax(a, 1);
+                    let probabilities = softmax(a, 1);
 
-                let genre = probabilities.argmax(1).into_scalar() as i64;
-                dbg!(genre);
+                    let genre_index = probabilities.argmax(1).into_scalar() as u8;
+                    let genre = unsafe { std::mem::transmute::<u8, Genre>(genre_index) };
+                    frequencies
+                        .entry(genre)
+                        .and_modify(|x| *x += 1)
+                        .or_insert(1);
+                }
+
+                let most_frequent = frequencies
+                    .into_iter()
+                    .max_by_key(|&(_, count)| count)
+                    .unwrap()
+                    .0;
+
+                println!(
+                    "{} {:?}",
+                    audio_path.file_name().unwrap().to_string_lossy(),
+                    most_frequent
+                );
             }
         }
     }
