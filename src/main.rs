@@ -1,5 +1,4 @@
-#![recursion_limit = "256"]
-
+use bincode::{Decode, Encode, config::standard, decode_from_std_read, encode_into_std_write};
 use burn::{
     backend::{Autodiff, NdArray},
     config::Config,
@@ -10,7 +9,7 @@ use burn::{
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig,
+        Dropout, DropoutConfig, LayerNorm, LayerNormConfig, Linear, LinearConfig,
         loss::CrossEntropyLossConfig,
         lstm::{BiLstm, BiLstmConfig},
     },
@@ -35,11 +34,12 @@ use rand::{Rng, SeedableRng, rngs::StdRng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
-    fs::{File, exists, read_dir, read_to_string, write},
-    path::Path,
-    path::PathBuf,
-    sync::OnceLock,
+    fs::{File, exists, read_dir, read_to_string},
+    io::{BufReader, BufWriter},
+    mem::transmute,
+    path::{Path, PathBuf},
 };
+use toml::from_str;
 
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{CODEC_TYPE_NULL, DecoderOptions};
@@ -49,20 +49,18 @@ use symphonia::core::meta::MetadataOptions;
 
 use symphonia::core::probe::Hint;
 
-use burn::backend::wgpu::{Wgpu, WgpuDevice, graphics::AutoGraphicsApi, init_setup_async};
-
-// Define our Autodiff backend type
 type MyAutodiffBackend = Autodiff<NdArray>;
 
-// -- 1. Two-Layer Network Module Definition --
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
     layer1: BiLstm<B>,
     layer2: Linear<B>,
-    layer3: Dropout,
-    layer4: Linear<B>,
-    layer5: Dropout,
-    layer6: Linear<B>,
+    layer3: LayerNorm<B>,
+    layer4: Dropout,
+    layer5: Linear<B>,
+    layer6: LayerNorm<B>,
+    layer7: Dropout,
+    layer8: Linear<B>,
 }
 
 #[derive(Config, Debug)]
@@ -75,11 +73,13 @@ impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
             layer1: BiLstmConfig::new(self.input_features, 64, true).init(device),
-            layer2: LinearConfig::new(128, 64).init(device),
-            layer3: DropoutConfig::new(0.5).init(),
-            layer4: LinearConfig::new(64, 64).init(device),
-            layer5: DropoutConfig::new(0.5).init(),
-            layer6: LinearConfig::new(64, self.output_features).init(device),
+            layer2: LinearConfig::new(128, 128).init(device),
+            layer3: LayerNormConfig::new(128).init(device),
+            layer4: DropoutConfig::new(0.3).init(),
+            layer5: LinearConfig::new(128, 128).init(device),
+            layer6: LayerNormConfig::new(128).init(device),
+            layer7: DropoutConfig::new(0.3).init(),
+            layer8: LinearConfig::new(128, self.output_features).init(device),
         }
     }
 }
@@ -92,28 +92,36 @@ impl<B: Backend> Network<B> {
         let input_3d = input
             .clone()
             .reshape([input.dims()[0], seq_len, input_size]);
-        let (lstm_output, _state) = self.layer1.forward(input_3d, None);
+        let (x, _state) = self.layer1.forward(input_3d, None);
 
-        let flat = lstm_output.mean_dim(1).squeeze(1);
+        let flat = x.mean_dim(1).squeeze(1);
 
         let x = relu(self.layer2.forward(flat));
         let x = self.layer3.forward(x);
-        let x = relu(self.layer4.forward(x));
-        let x = self.layer5.forward(x);
-        self.layer6.forward(x)
+        let x = self.layer4.forward(x);
+        let x = relu(self.layer5.forward(x));
+        let x = self.layer6.forward(x);
+        let x = self.layer7.forward(x);
+
+        self.layer8.forward(x)
     }
 }
 
-static MAX_SAMPLES_N: usize = (CROP_PAD / FRAME_SIZE) * (N_COEFFS * 3);
+const MAX_SAMPLES_N: usize = (CROP_PAD / FRAME_SIZE) * (N_COEFFS * 3);
 
-static CROP_PAD: usize = 2_usize.pow(16);
-static FRAME_SIZE: usize = 2_usize.pow(10);
+const CROP_SECONDS: usize = 5;
+const FRAME_SIZE: usize = 2_usize.pow(10);
 const N_FILTERS: usize = 40;
 const N_COEFFS: usize = 20;
 
+const SAMPLE_RATE: usize = 44100;
+const CROP_PAD: usize = (SAMPLE_RATE * CROP_SECONDS).next_power_of_two();
+
 const PART_FOR_TRAINING: f32 = 0.9;
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+const BATCH_SIZE: usize = 32;
+
+#[derive(Clone, Debug, Encode, Decode, PartialEq, Eq, Hash)]
 enum Genre {
     Punk,
     RockNRoll,
@@ -157,9 +165,7 @@ pub struct AudioBatch<B: Backend> {
     pub targets: Tensor<B, 1, Int>,
 }
 
-use serde::Serialize;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Encode, Decode)]
 pub struct AudioItem {
     genre: Genre,
     samples: Vec<f64>,
@@ -226,19 +232,17 @@ impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B
 pub struct TrainingConfig {
     pub model: NetworkConfig,
     pub optimizer: AdamConfig,
-    #[config(default = 10000)]
+    #[config(default = 500)]
     pub num_epochs: usize,
     #[config(default = 4)]
     pub num_workers: usize,
     #[config(default = 42)]
     pub seed: u64,
-    #[config(default = 1.0e-3)]
+    #[config(default = 1.0e-4)]
     pub learning_rate: f64,
 }
 
-const ITEMS_FILE: &str = "items.json";
-
-static SAMPLE_RATE: OnceLock<u32> = OnceLock::new();
+const ITEMS_FILE: &str = "items.bin";
 
 pub fn mfccs_for_audio(path: &PathBuf, all_mfccs: &mut Vec<f64>) {
     let src = File::open(path).unwrap();
@@ -250,9 +254,10 @@ pub fn mfccs_for_audio(path: &PathBuf, all_mfccs: &mut Vec<f64>) {
     let meta_opts: MetadataOptions = Default::default();
     let fmt_opts: FormatOptions = Default::default();
 
-    let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &fmt_opts, &meta_opts)
-        .unwrap();
+    let probed = match symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts) {
+        Ok(probed) => probed,
+        Err(_) => return,
+    };
 
     let mut format = probed.format;
 
@@ -260,7 +265,8 @@ pub fn mfccs_for_audio(path: &PathBuf, all_mfccs: &mut Vec<f64>) {
         .tracks()
         .iter()
         .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .unwrap();
+        .unwrap()
+        .clone();
 
     let dec_opts: DecoderOptions = Default::default();
 
@@ -272,6 +278,14 @@ pub fn mfccs_for_audio(path: &PathBuf, all_mfccs: &mut Vec<f64>) {
 
     let mut samples = vec![];
 
+    let mut rng = StdRng::from_os_rng();
+
+    let crop_start =
+        (track.codec_params.n_frames.unwrap() as f32 * rng.random_range(0.0..1.0)) as usize;
+    let crop_range = crop_start..(crop_start + CROP_PAD);
+
+    let mut n = 0;
+
     while let Ok(packet) = format.next_packet() {
         if packet.track_id() != track_id {
             continue;
@@ -282,25 +296,38 @@ pub fn mfccs_for_audio(path: &PathBuf, all_mfccs: &mut Vec<f64>) {
         let spec = decoded.spec();
         let duration = decoded.capacity();
 
-        let _ = SAMPLE_RATE.set(spec.rate);
-
         let mut buf = SampleBuffer::<f32>::new(duration as u64, *spec);
         buf.copy_interleaved_ref(decoded);
+
         for &sample in buf.samples().iter() {
-            samples.push((sample * i16::MAX as f32) as i16);
+            if crop_range.contains(&n) {
+                samples.push((sample * i16::MAX as f32) as i16);
+            }
+
+            n += 1;
         }
+
+        // if n + samples_n < crop_range.start {
+        //     n += samples_n
+        // } else if n > crop_range.end {
+        //     break 'packet_loop;
+        // } else {
+        //     for &sample in buf.samples().iter() {
+        //         if crop_range.contains(&n) {
+        //             samples.push((sample * i16::MAX as f32) as i16);
+        //         }
+        //
+        //         n += 1;
+        //     }
+        // }
     }
 
-    let mut rng = StdRng::from_os_rng();
-
-    let crop_start = (samples.len() as f32 * rng.random_range(0.0..1.0)) as usize;
-    let slice = &samples[crop_start..(crop_start + CROP_PAD).min(samples.len())];
-
-    for chunk in slice.chunks(FRAME_SIZE) {
+    for chunk in samples.chunks(FRAME_SIZE) {
         if chunk.len() == FRAME_SIZE {
-            let mut state = Transform::new(*SAMPLE_RATE.get().unwrap() as usize, FRAME_SIZE)
-                .nfilters(N_COEFFS, N_FILTERS)
-                .normlength(10);
+            let mut state =
+                Transform::new(track.codec_params.sample_rate.unwrap() as usize, FRAME_SIZE)
+                    .nfilters(N_COEFFS, N_FILTERS)
+                    .normlength(10);
 
             let mut output = vec![0.0; N_COEFFS * 3];
             state.transform(chunk, &mut output);
@@ -351,13 +378,13 @@ pub fn train<B: AutodiffBackend>(
     let for_validation = &items[threshold..];
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(for_training.len() / 7)
+        .batch_size(BATCH_SIZE)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
         .build(InMemDataset::new(for_training.to_vec()));
 
     let dataloader_test = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(for_validation.len() / 2)
+        .batch_size(BATCH_SIZE)
         .num_workers(config.num_workers)
         .build(InMemDataset::new(for_validation.to_vec()));
 
@@ -367,6 +394,9 @@ pub fn train<B: AutodiffBackend>(
         Direction::Highest,
         Split::Valid,
     );
+
+    let steps_per_epoch = for_training.len().div_ceil(BATCH_SIZE);
+    let total_steps = steps_per_epoch * config.num_epochs;
 
     let learner = LearnerBuilder::new(ARTIFACT_DIR)
         .metric_train_numeric(AccuracyMetric::new())
@@ -381,7 +411,7 @@ pub fn train<B: AutodiffBackend>(
         .build(
             config.model.init::<B>(&device),
             config.optimizer.init(),
-            CosineAnnealingLrSchedulerConfig::new(config.learning_rate, 50)
+            CosineAnnealingLrSchedulerConfig::new(config.learning_rate, total_steps)
                 .init()
                 .unwrap(),
         );
@@ -408,25 +438,26 @@ struct TomlConfig {
     mode: Mode,
 }
 
-const ITERATIONS: usize = 50;
+const ITERATIONS: usize = 100;
 
 pub fn main() {
     let data = read_to_string(CONFIG_FILE).unwrap();
 
-    let config: TomlConfig = toml::from_str(&data).unwrap();
+    let config: TomlConfig = from_str(&data).unwrap();
 
     match config.mode {
         Mode::Train => {
             let mut items = vec![];
 
             if exists(ITEMS_FILE).unwrap() {
-                let data = read_to_string(ITEMS_FILE).unwrap();
-                items = serde_json::from_str::<Vec<AudioItem>>(&data).unwrap();
+                let file = File::open(ITEMS_FILE).unwrap();
+                let mut reader = BufReader::new(file);
+                items = decode_from_std_read(&mut reader, standard()).unwrap();
             } else {
                 get_items(&mut items);
-
-                let string = serde_json::to_string_pretty(&items).unwrap();
-                write(ITEMS_FILE, string).unwrap();
+                let file = File::create(ITEMS_FILE).unwrap();
+                let mut writer = BufWriter::new(file);
+                encode_into_std_write(&items, &mut writer, standard()).unwrap();
             }
 
             let device = Default::default();
@@ -461,17 +492,18 @@ pub fn main() {
                 mfccs_for_audio(&audio_path, &mut all_mfccs);
 
                 let mut frequencies = HashMap::with_capacity(ITERATIONS);
-                let data = TensorData::from(all_mfccs.as_slice());
-                let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
-                let tensor = b.reshape([1, -1]);
 
                 for _ in 0..ITERATIONS {
-                    let a = model.forward(tensor.clone());
+                    let data = TensorData::from(all_mfccs.as_slice());
+                    let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
+                    let tensor = b.reshape([1, -1]);
+
+                    let a = model.forward(tensor);
 
                     let probabilities = softmax(a, 1);
 
                     let genre_index = probabilities.argmax(1).into_scalar() as u8;
-                    let genre = unsafe { std::mem::transmute::<u8, Genre>(genre_index) };
+                    let genre = unsafe { transmute::<u8, Genre>(genre_index) };
                     frequencies
                         .entry(genre)
                         .and_modify(|x| *x += 1)
