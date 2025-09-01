@@ -11,8 +11,9 @@ use burn::{
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
     nn::{
-        BatchNorm, BatchNormConfig, Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
+        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
         conv::{Conv1d, Conv1dConfig},
+        gru::{Gru, GruConfig},
         loss::CrossEntropyLossConfig,
         pool::{MaxPool1d, MaxPool1dConfig},
     },
@@ -61,15 +62,12 @@ type MyAutodiffBackend = Autodiff<Wgpu<f32, i32>>;
 
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
-    layer1: Conv1d<B>,
-    bn1: BatchNorm<B, 1>,
-    layer2: MaxPool1d,
-    layer3: Conv1d<B>,
-    bn2: BatchNorm<B, 1>,
-    layer4: MaxPool1d,
-    layer5: Linear<B>,
-    layer6: Dropout,
-    layer7: Linear<B>,
+    conv1: Conv1d<B>,
+    maxpool1: MaxPool1d,
+    dropout1: Dropout,
+    gru1: Gru<B>,
+    linear1: Linear<B>,
+    linear2: Linear<B>,
 }
 
 #[derive(Config, Debug)]
@@ -81,19 +79,14 @@ pub struct NetworkConfig {
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            layer1: Conv1dConfig::new(self.input_features, 128, 5)
+            conv1: Conv1dConfig::new(self.input_features, 64, 3)
                 .with_padding(PaddingConfig1d::Same)
                 .init(device),
-            bn1: BatchNormConfig::new(128).init(device),
-            layer2: MaxPool1dConfig::new(2).init(),
-            layer3: Conv1dConfig::new(128, 128, 5)
-                .with_padding(PaddingConfig1d::Same)
-                .init(device),
-            bn2: BatchNormConfig::new(128).init(device),
-            layer4: MaxPool1dConfig::new(2).init(),
-            layer5: LinearConfig::new(128, 128).init(device),
-            layer6: DropoutConfig::new(0.5).init(),
-            layer7: LinearConfig::new(128, self.output_features).init(device),
+            maxpool1: MaxPool1dConfig::new(2).init(),
+            dropout1: DropoutConfig::new(0.3).init(),
+            gru1: GruConfig::new(64, 128, true).init(device),
+            linear1: LinearConfig::new(128, 128).init(device),
+            linear2: LinearConfig::new(128, self.output_features).init(device),
         }
     }
 }
@@ -113,22 +106,18 @@ impl<B: Backend> Network<B> {
         let dims = input.dims();
         let mut x = input.reshape([dims[0], INPUT_SIZE, CROP_PAD / FRAME_SIZE]);
 
-        x = self.layer1.forward(x);
-        x = self.bn1.forward(x);
-        x = gelu(x);
-        x = self.layer2.forward(x);
-        x = self.layer3.forward(x);
-        x = self.bn2.forward(x);
-        x = gelu(x);
-        x = self.layer4.forward(x);
+        x = gelu(self.conv1.forward(x));
+        x = self.maxpool1.forward(x);
+        x = self.dropout1.forward(x);
 
-        let mut x = x.mean_dim(2).squeeze(2);
+        let mut x = x.transpose();
+        x = self.gru1.forward(x, None);
 
-        x = self.layer5.forward(x);
-        x = gelu(x);
-        x = self.layer6.forward(x);
+        let mut x = x.mean_dim(1).squeeze(1);
+        x = gelu(self.linear1.forward(x));
+        x = self.linear2.forward(x);
 
-        self.layer7.forward(x)
+        x
     }
 }
 
@@ -337,9 +326,7 @@ pub fn audio_crops(path: &PathBuf) -> Option<Vec<PathBuf>> {
         }
     }
 
-    let mut state = Transform::new(SAMPLE_RATE, FRAME_SIZE)
-        .nfilters(N_COEFFS, N_FILTERS)
-        .normlength(30);
+    let mut state = Transform::new(SAMPLE_RATE, FRAME_SIZE).nfilters(N_COEFFS, N_FILTERS);
 
     let mut crops = Vec::with_capacity(CROPS);
 
@@ -351,6 +338,18 @@ pub fn audio_crops(path: &PathBuf) -> Option<Vec<PathBuf>> {
             let mut output = vec![0.0; N_COEFFS * 3];
             state.transform(chunk, &mut output);
             all_mfccs.extend_from_slice(&output);
+        }
+
+        assert_eq!(all_mfccs.len(), MAX_SAMPLES_N);
+
+        let min_mfcc = -100.0;
+        let max_mfcc = 100.0;
+        let range = max_mfcc - min_mfcc;
+
+        for val in all_mfccs.iter_mut() {
+            *val = 2.0 * (*val - min_mfcc) / range - 1.0;
+            // Clamping (optional)
+            *val = val.clamp(-1.0, 1.0);
         }
 
         let now = SystemTime::now()
