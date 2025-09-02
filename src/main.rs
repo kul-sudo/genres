@@ -1,4 +1,8 @@
 #![recursion_limit = "256"]
+mod audio;
+mod consts;
+mod genre;
+mod lazy_init;
 
 use bincode::{Decode, Encode, config::standard, decode_from_std_read, encode_into_std_write};
 use burn::{
@@ -11,14 +15,11 @@ use burn::{
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
-        conv::{Conv1d, Conv1dConfig},
+        Dropout, DropoutConfig, Linear, LinearConfig,
         gru::{Gru, GruConfig},
         loss::CrossEntropyLossConfig,
-        pool::{MaxPool1d, MaxPool1dConfig},
     },
     optim::AdamConfig,
-    optim::decay::WeightDecayConfig,
     record::CompactRecorder,
     tensor::{
         ElementConversion, Int, Tensor, TensorData,
@@ -34,38 +35,24 @@ use burn::{
         },
     },
 };
-use mfcc::Transform;
-use rand::{
-    Rng, rng,
-    seq::{IndexedRandom, SliceRandom},
-};
+use consts::*;
+use genre::*;
+use lazy_init::*;
+use rand::{rng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
-    fs::{File, create_dir, exists, read_dir, read_to_string},
+    fs::{File, create_dir, exists, read_to_string},
     io::{BufReader, BufWriter},
     path::{Path, PathBuf},
-    sync::LazyLock,
-    time::{SystemTime, UNIX_EPOCH},
 };
 use toml::from_str;
-
-use symphonia::core::{
-    audio::SampleBuffer,
-    codecs::{CODEC_TYPE_NULL, DecoderOptions},
-    formats::FormatOptions,
-    io::MediaSourceStream,
-    meta::MetadataOptions,
-    probe::Hint,
-};
 
 type MyAutodiffBackend = Autodiff<Wgpu<f32, i32>>;
 
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
-    conv1: Conv1d<B>,
-    maxpool1: MaxPool1d,
-    dropout1: Dropout,
     gru1: Gru<B>,
+    dropout1: Dropout,
     linear1: Linear<B>,
     linear2: Linear<B>,
 }
@@ -79,94 +66,32 @@ pub struct NetworkConfig {
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            conv1: Conv1dConfig::new(self.input_features, 64, 3)
-                .with_padding(PaddingConfig1d::Same)
-                .init(device),
-            maxpool1: MaxPool1dConfig::new(2).init(),
+            gru1: GruConfig::new(self.input_features, 64, true).init(device),
             dropout1: DropoutConfig::new(0.3).init(),
-            gru1: GruConfig::new(64, 128, true).init(device),
-            linear1: LinearConfig::new(128, 128).init(device),
-            linear2: LinearConfig::new(128, self.output_features).init(device),
+            linear1: LinearConfig::new(64, 64).init(device),
+            linear2: LinearConfig::new(64, self.output_features).init(device),
         }
     }
 }
 
-const INPUT_SIZE: usize = N_COEFFS * 3;
-
 impl<B: Backend> Network<B> {
     pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        debug_assert_eq!(
-            input.dims()[1],
-            N_COEFFS * 3 * (MAX_SAMPLES_N / (N_COEFFS * 3)),
-            "Input size mismatch: expected {}, got {}",
-            N_COEFFS * 3 * (MAX_SAMPLES_N / (N_COEFFS * 3)),
-            input.dims()[1]
-        );
+        let input_size = N_COEFFS * 3;
 
-        let dims = input.dims();
-        let mut x = input.reshape([dims[0], INPUT_SIZE, CROP_PAD / FRAME_SIZE]);
+        let seq_len = MAX_SAMPLES_N / input_size;
 
-        x = gelu(self.conv1.forward(x));
-        x = self.maxpool1.forward(x);
+        let input_3d = input
+            .clone()
+            .reshape([input.dims()[0], seq_len, input_size]);
+
+        let mut x = self.gru1.forward(input_3d, None);
         x = self.dropout1.forward(x);
 
-        let mut x = x.transpose();
-        x = self.gru1.forward(x, None);
-
-        let mut x = x.mean_dim(1).squeeze(1);
+        let mut x = x.max_dim(1).squeeze(1);
         x = gelu(self.linear1.forward(x));
         x = self.linear2.forward(x);
 
         x
-    }
-}
-
-const MAX_SAMPLES_N: usize = (CROP_PAD / FRAME_SIZE) * (N_COEFFS * 3);
-
-const CROP_SECONDS: usize = 4;
-const FRAME_SIZE: usize = 2_usize.pow(10);
-const N_FILTERS: usize = 40;
-const N_COEFFS: usize = 20;
-
-const SAMPLE_RATE: usize = 44100;
-const CROP_PAD: usize = (SAMPLE_RATE * CROP_SECONDS).next_power_of_two();
-
-const PART_FOR_TRAINING: f32 = 0.9;
-
-const BATCH_SIZE: usize = 32;
-
-#[derive(Copy, Clone, Debug, Encode, Decode, PartialEq, Eq, Hash)]
-enum Genre {
-    Punk,
-    RockNRoll,
-    Pop,
-    Electronic,
-}
-
-impl Genre {
-    const GENRES_N: usize = 4;
-}
-
-impl From<Genre> for i64 {
-    fn from(genre: Genre) -> i64 {
-        match genre {
-            Genre::Punk => 0,
-            Genre::RockNRoll => 1,
-            Genre::Pop => 2,
-            Genre::Electronic => 3,
-        }
-    }
-}
-
-impl From<String> for Genre {
-    fn from(string: String) -> Genre {
-        match string.as_str() {
-            "punk" => Genre::Punk,
-            "rocknroll" => Genre::RockNRoll,
-            "pop" => Genre::Pop,
-            "electronic" => Genre::Electronic,
-            _ => panic!(),
-        }
     }
 }
 
@@ -182,18 +107,33 @@ pub struct AudioBatch<B: Backend> {
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct AudioItem {
     genre: Genre,
-    crops: Vec<PathBuf>,
+    crop: PathBuf,
 }
 
-const ARTIFACT_DIR: &str = "artifact";
+impl AudioItem {
+    pub fn get_items(items: &mut Vec<AudioItem>) {
+        for (genre, paths) in &*FILES {
+            for (_, data) in paths {
+                if let Some(mfcc) = data {
+                    let mut b = mfcc.clone();
+                    b.normalize();
+                    let crop = b.save();
+                    items.push(AudioItem {
+                        genre: *genre,
+                        crop,
+                    });
+                }
+            }
+        }
+    }
+}
 
 impl<B: Backend> Batcher<B, AudioItem, AudioBatch<B>> for AudioBatcher {
     fn batch(&self, items: Vec<AudioItem>, device: &B::Device) -> AudioBatch<B> {
         let images = items
             .iter()
             .map(|item| {
-                let crop = item.crops.choose(&mut rng()).unwrap();
-                let file = File::open(crop).unwrap();
+                let file = File::open(item.crop.clone()).unwrap();
                 let mut reader = BufReader::new(file);
                 let items: Vec<f64> = decode_from_std_read(&mut reader, standard()).unwrap();
 
@@ -263,128 +203,6 @@ pub struct TrainingConfig {
     pub learning_rate: f64,
 }
 
-static ITEMS_FILE: LazyLock<PathBuf> = LazyLock::new(|| PathBuf::from(ITEMS_DIR).join("items.bin"));
-const ITEMS_DIR: &str = "items";
-const CROPS: usize = 4;
-
-pub fn audio_crops(path: &PathBuf) -> Option<Vec<PathBuf>> {
-    let src = File::open(path).unwrap();
-    let mss = MediaSourceStream::new(Box::new(src), Default::default());
-
-    let mut hint = Hint::new();
-    hint.with_extension("wav");
-
-    let meta_opts: MetadataOptions = Default::default();
-    let fmt_opts: FormatOptions = Default::default();
-
-    let probed = match symphonia::default::get_probe().format(&hint, mss, &fmt_opts, &meta_opts) {
-        Ok(probed) => probed,
-        Err(_) => return None,
-    };
-
-    let mut format = probed.format;
-
-    let track = format
-        .tracks()
-        .iter()
-        .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
-        .unwrap()
-        .clone();
-
-    let dec_opts: DecoderOptions = Default::default();
-
-    let mut decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &dec_opts)
-        .unwrap();
-
-    let track_id = track.id;
-
-    let mut samples = vec![];
-
-    while let Ok(packet) = format.next_packet() {
-        if packet.track_id() != track_id {
-            continue;
-        }
-
-        let decoded = decoder.decode(&packet).unwrap();
-
-        let spec = decoded.spec();
-        assert_eq!(spec.rate as usize, SAMPLE_RATE);
-
-        let channels_n = spec.channels.count();
-
-        let duration = decoded.capacity();
-
-        let mut buf = SampleBuffer::<f32>::new(duration as u64, *spec);
-        buf.copy_interleaved_ref(decoded);
-
-        let buf_samples = buf.samples();
-
-        for sample in buf_samples.chunks_exact(channels_n) {
-            let mono = sample.iter().sum::<f32>() / sample.len() as f32;
-            samples.push((mono * i16::MAX as f32) as i16);
-        }
-    }
-
-    let mut state = Transform::new(SAMPLE_RATE, FRAME_SIZE).nfilters(N_COEFFS, N_FILTERS);
-
-    let mut crops = Vec::with_capacity(CROPS);
-
-    for _ in 0..CROPS {
-        let mut all_mfccs = Vec::with_capacity(MAX_SAMPLES_N);
-        let crop_start = rng().random_range(0..samples.len() - CROP_PAD) as usize;
-        let crop_range = crop_start..(crop_start + CROP_PAD);
-        for chunk in samples[crop_range].chunks_exact(FRAME_SIZE) {
-            let mut output = vec![0.0; N_COEFFS * 3];
-            state.transform(chunk, &mut output);
-            all_mfccs.extend_from_slice(&output);
-        }
-
-        assert_eq!(all_mfccs.len(), MAX_SAMPLES_N);
-
-        let min_mfcc = -100.0;
-        let max_mfcc = 100.0;
-        let range = max_mfcc - min_mfcc;
-
-        for val in all_mfccs.iter_mut() {
-            *val = 2.0 * (*val - min_mfcc) / range - 1.0;
-            // Clamping (optional)
-            *val = val.clamp(-1.0, 1.0);
-        }
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = PathBuf::from(ITEMS_DIR).join(format!("{now}.bin"));
-        let file = File::create(&path).unwrap();
-        let mut writer = BufWriter::new(file);
-        encode_into_std_write(&all_mfccs, &mut writer, standard()).unwrap();
-
-        crops.push(path)
-    }
-
-    Some(crops)
-}
-
-pub fn get_items(items: &mut Vec<AudioItem>) {
-    for entry in read_dir("genres").unwrap() {
-        let entry = entry.unwrap();
-        let path = entry.path();
-        let name = path.file_name().unwrap();
-        let genre = Genre::from(name.to_string_lossy().to_string());
-
-        for audio in read_dir(&path).unwrap() {
-            let audio = audio.unwrap();
-            let audio_path = audio.path();
-
-            if let Some(crops) = audio_crops(&audio_path) {
-                items.push(AudioItem { genre, crops });
-            }
-        }
-    }
-}
-
 pub fn train<B: AutodiffBackend>(
     config: TrainingConfig,
     items: &mut [AudioItem],
@@ -397,8 +215,7 @@ pub fn train<B: AutodiffBackend>(
     items.shuffle(&mut rng());
 
     let threshold = (items.len() as f32 * PART_FOR_TRAINING) as usize;
-    let for_training = &items[..threshold];
-    let for_validation = &items[threshold..];
+    let (for_training, for_validation) = items.split_at(threshold);
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
         .batch_size(BATCH_SIZE)
@@ -448,8 +265,6 @@ pub fn train<B: AutodiffBackend>(
         .expect("Trained model should be saved successfully");
 }
 
-const CONFIG_FILE: &str = "config.toml";
-
 #[derive(Deserialize)]
 enum Mode {
     Train,
@@ -460,8 +275,6 @@ enum Mode {
 struct TomlConfig {
     mode: Mode,
 }
-
-const ITERATIONS: usize = 1;
 
 pub fn main() {
     if !exists(ITEMS_DIR).unwrap() {
@@ -476,13 +289,13 @@ pub fn main() {
         Mode::Train => {
             let mut items = vec![];
 
-            if exists(&*ITEMS_FILE).unwrap() {
-                let file = File::open(&*ITEMS_FILE).unwrap();
+            if exists(ITEMS_FILE).unwrap() {
+                let file = File::open(ITEMS_FILE).unwrap();
                 let mut reader = BufReader::new(file);
                 items = decode_from_std_read(&mut reader, standard()).unwrap();
             } else {
-                get_items(&mut items);
-                let file = File::create(&*ITEMS_FILE).unwrap();
+                AudioItem::get_items(&mut items);
+                let file = File::create(ITEMS_FILE).unwrap();
                 let mut writer = BufWriter::new(file);
                 encode_into_std_write(&items, &mut writer, standard()).unwrap();
             }
@@ -492,7 +305,7 @@ pub fn main() {
             train::<MyAutodiffBackend>(
                 TrainingConfig::new(
                     NetworkConfig::new(INPUT_SIZE, Genre::GENRES_N),
-                    AdamConfig::new().with_weight_decay(Some(WeightDecayConfig::new(0.02))),
+                    AdamConfig::new(),
                 ),
                 &mut items,
                 device,
