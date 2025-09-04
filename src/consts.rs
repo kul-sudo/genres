@@ -1,4 +1,4 @@
-pub const ITERATIONS: usize = 1;
+pub const ITERATIONS: usize = 5;
 pub const INPUT_SIZE: usize = N_COEFFS * 3;
 pub const MAX_SAMPLES_N: usize = (CROP_PAD / FRAME_SIZE) * (N_COEFFS * 3);
 const CROP_SECONDS: usize = 4; // More second may be read due to the presence "next_power_of_two"
@@ -11,6 +11,8 @@ pub const CROP_PAD: usize = (SAMPLE_RATE * CROP_SECONDS).next_power_of_two();
 pub const PART_FOR_TRAINING: f32 = 0.9; // What part of the entire dataset is used for training
 // (the rest goes into validation)
 pub const BATCH_SIZE: usize = 32;
+
+pub const CROPS_N: usize = 5;
 
 pub const CONFIG_FILE: &str = "config.toml";
 pub const ARTIFACT_DIR: &str = "artifact";

@@ -3,8 +3,11 @@ mod audio;
 mod consts;
 mod genre;
 mod lazy_init;
+mod params;
 
+use audio::{MfccData, MfccSource};
 use bincode::{Decode, Encode, config::standard, decode_from_std_read, encode_into_std_write};
+use burn::tensor::activation::softmax;
 use burn::{
     backend::{Autodiff, Wgpu, wgpu::WgpuDevice},
     config::Config,
@@ -15,8 +18,7 @@ use burn::{
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig,
-        gru::{Gru, GruConfig},
+        BiLstm, BiLstmConfig, Dropout, DropoutConfig, Linear, LinearConfig,
         loss::CrossEntropyLossConfig,
     },
     optim::AdamConfig,
@@ -41,8 +43,10 @@ use lazy_init::*;
 use rand::{rng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
-    fs::{File, create_dir, exists, read_to_string},
+    collections::HashMap,
+    fs::{File, create_dir, exists, read_dir, read_to_string},
     io::{BufReader, BufWriter},
+    mem::transmute,
     path::{Path, PathBuf},
 };
 use toml::from_str;
@@ -51,7 +55,7 @@ type MyAutodiffBackend = Autodiff<Wgpu<f32, i32>>;
 
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
-    gru1: Gru<B>,
+    lstm1: BiLstm<B>,
     dropout1: Dropout,
     linear1: Linear<B>,
     linear2: Linear<B>,
@@ -66,10 +70,10 @@ pub struct NetworkConfig {
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            gru1: GruConfig::new(self.input_features, 64, true).init(device),
+            lstm1: BiLstmConfig::new(self.input_features, 64, true).init(device),
             dropout1: DropoutConfig::new(0.3).init(),
-            linear1: LinearConfig::new(64, 64).init(device),
-            linear2: LinearConfig::new(64, self.output_features).init(device),
+            linear1: LinearConfig::new(128, 128).init(device),
+            linear2: LinearConfig::new(128, self.output_features).init(device),
         }
     }
 }
@@ -84,10 +88,11 @@ impl<B: Backend> Network<B> {
             .clone()
             .reshape([input.dims()[0], seq_len, input_size]);
 
-        let mut x = self.gru1.forward(input_3d, None);
+        let (mut x, _) = self.lstm1.forward(input_3d, None);
+
+        let mut x = x.mean_dim(1).squeeze(1);
         x = self.dropout1.forward(x);
 
-        let mut x = x.max_dim(1).squeeze(1);
         x = gelu(self.linear1.forward(x));
         x = self.linear2.forward(x);
 
@@ -113,8 +118,8 @@ pub struct AudioItem {
 impl AudioItem {
     pub fn get_items(items: &mut Vec<AudioItem>) {
         for (genre, paths) in &*FILES {
-            for (_, data) in paths {
-                if let Some(mfcc) = data {
+            for audio in paths {
+                if let Some(mfcc) = audio.data() {
                     let mut b = mfcc.clone();
                     b.normalize();
                     let crop = b.save();
@@ -228,7 +233,7 @@ pub fn train<B: AutodiffBackend>(
         .num_workers(config.num_workers)
         .build(InMemDataset::new(for_validation.to_vec()));
 
-    let a = MetricCheckpointingStrategy::new(
+    let strategy = MetricCheckpointingStrategy::new(
         &AccuracyMetric::<B>::new(),
         Aggregate::Mean,
         Direction::Highest,
@@ -244,7 +249,7 @@ pub fn train<B: AutodiffBackend>(
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
         .with_file_checkpointer(CompactRecorder::new())
-        .with_checkpointing_strategy(a)
+        .with_checkpointing_strategy(strategy)
         .devices(vec![device.clone()])
         .num_epochs(config.num_epochs)
         .summary()
@@ -312,56 +317,54 @@ pub fn main() {
             );
         }
         Mode::Test => {
-            // let device = WgpuDevice::default();
-            // let mut model = NetworkConfig::new(N_COEFFS * 3, Genre::GENRES_N)
-            //     .init::<MyAutodiffBackend>(&device);
-            //
-            // model = model
-            //     .load_file(
-            //         Path::new("models").join("model"),
-            //         &CompactRecorder::new(),
-            //         &device,
-            //     )
-            //     .unwrap();
-            //
-            // for audio in read_dir("test").unwrap() {
-            //     let audio = audio.unwrap();
-            //     let audio_path = audio.path();
-            //
-            //     let mut all_mfccs = Vec::new();
-            //     mfccs_for_audio(&audio_path, &mut all_mfccs);
-            //
-            //     let mut frequencies = HashMap::with_capacity(ITERATIONS);
-            //
-            //     for _ in 0..ITERATIONS {
-            //         let data = TensorData::from(all_mfccs.as_slice());
-            //         let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
-            //         let tensor = b.reshape([1, -1]);
-            //
-            //         let a = model.forward(tensor);
-            //
-            //         let probabilities = softmax(a, 1);
-            //
-            //         let genre_index = probabilities.argmax(1).into_scalar() as u8;
-            //         let genre = unsafe { transmute::<u8, Genre>(genre_index) };
-            //         frequencies
-            //             .entry(genre)
-            //             .and_modify(|x| *x += 1)
-            //             .or_insert(1);
-            //     }
-            //
-            //     let most_frequent = frequencies
-            //         .into_iter()
-            //         .max_by_key(|&(_, count)| count)
-            //         .unwrap()
-            //         .0;
-            //
-            //     println!(
-            //         "{} {:?}",
-            //         audio_path.file_name().unwrap().to_string_lossy(),
-            //         most_frequent
-            //     );
-            // }
+            let device = WgpuDevice::default();
+            let mut model = NetworkConfig::new(N_COEFFS * 3, Genre::GENRES_N)
+                .init::<MyAutodiffBackend>(&device);
+
+            model = model
+                .load_file(
+                    Path::new("models").join("model"),
+                    &CompactRecorder::new(),
+                    &device,
+                )
+                .unwrap();
+
+            for audio in read_dir("test").unwrap() {
+                let audio = audio.unwrap();
+                let audio_path = audio.path();
+
+                let data =
+                    MfccData::new(MfccSource::Path(audio_path.clone().into_boxed_path())).unwrap();
+
+                let mut frequencies = HashMap::with_capacity(ITERATIONS);
+
+                for _ in 0..ITERATIONS {
+                    let data = TensorData::from(data.data());
+                    let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
+                    let tensor = b.reshape([1, -1]);
+
+                    let a = model.forward(tensor);
+
+                    let genre_index = a.argmax(1).into_scalar() as u8;
+                    let genre = unsafe { transmute::<u8, Genre>(genre_index) };
+                    frequencies
+                        .entry(genre)
+                        .and_modify(|x| *x += 1)
+                        .or_insert(1);
+                }
+
+                let most_frequent = frequencies
+                    .into_iter()
+                    .max_by_key(|&(_, count)| count)
+                    .unwrap()
+                    .0;
+
+                println!(
+                    "{} {:?}",
+                    audio_path.file_name().unwrap().to_string_lossy(),
+                    most_frequent
+                );
+            }
         }
     }
 }

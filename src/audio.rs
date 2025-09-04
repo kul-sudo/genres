@@ -1,5 +1,4 @@
-use crate::consts::*;
-use crate::lazy_init::*;
+use crate::{consts::*, params::*};
 use bincode::{config::standard, encode_into_std_write};
 use mfcc::Transform;
 use rand::{Rng, rng};
@@ -7,7 +6,6 @@ use std::{
     fs::File,
     io::BufWriter,
     path::{Path, PathBuf},
-    sync::LazyLock,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,31 +18,8 @@ use symphonia::core::{
     probe::Hint,
 };
 
-pub struct MfccParams {
-    std: f64,
-    mean: f64,
-}
-
-pub static MFCC_PARAMS: LazyLock<MfccParams> = LazyLock::new(|| {
-    let mut all_mfccs = vec![];
-
-    for paths in FILES.values() {
-        for (_, data) in paths {
-            if let Some(mfcc) = data {
-                all_mfccs.extend_from_slice(mfcc.data());
-            }
-        }
-    }
-
-    let mean = all_mfccs.iter().sum::<f64>() / all_mfccs.len() as f64;
-    let std: f64 =
-        (all_mfccs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / all_mfccs.len() as f64).sqrt();
-
-    MfccParams { std, mean }
-});
-
 pub enum MfccSource {
-    Path(PathBuf),
+    Path(Box<Path>),
     Samples(Vec<i16>),
 }
 
@@ -55,12 +30,13 @@ pub struct MfccData {
 
 impl MfccData {
     pub fn normalize(&mut self) {
+        let (std, mean) = MFCC_PARAMS.pair();
         for val in self.data.iter_mut() {
-            *val = (*val - MFCC_PARAMS.mean) / (MFCC_PARAMS.std + 1e-8);
+            *val = (*val - mean) / (std + 1e-8);
         }
     }
 
-    pub fn data(&self) -> &Vec<f64> {
+    pub fn data(&self) -> &[f64] {
         &self.data
     }
 

@@ -1,11 +1,18 @@
-use crate::audio::*;
-use crate::consts::*;
-use crate::genre::*;
+use crate::{audio::*, consts::*, genre::*};
 use std::{collections::HashMap, fs::read_dir, path::PathBuf, sync::LazyLock};
 
-type Entries = Vec<(PathBuf, Option<MfccData>)>;
+#[derive(Clone)]
+pub struct Audio {
+    data: Option<MfccData>,
+}
 
-pub static FILES: LazyLock<HashMap<Genre, Entries>> = LazyLock::new(|| {
+impl Audio {
+    pub fn data(&self) -> &Option<MfccData> {
+        &self.data
+    }
+}
+
+pub static FILES: LazyLock<HashMap<Genre, Vec<Audio>>> = LazyLock::new(|| {
     let mut files = HashMap::with_capacity(Genre::GENRES_N);
 
     for entry in read_dir(GENRES_DIR).unwrap() {
@@ -14,18 +21,20 @@ pub static FILES: LazyLock<HashMap<Genre, Entries>> = LazyLock::new(|| {
         let name = path.file_name().unwrap();
         let genre = Genre::from(name.to_string_lossy().to_string());
 
-        for audio in read_dir(&path).unwrap() {
-            let audio = audio.unwrap();
-            let audio_path = audio.path();
+        for audio_entry in read_dir(&path).unwrap() {
+            let audio_entry = audio_entry.unwrap();
+            let audio_path = audio_entry.path();
 
-            let data = MfccData::new(MfccSource::Path(path.to_path_buf()));
+            for _ in 0..CROPS_N {
+                let data = MfccData::new(MfccSource::Path(audio_path.clone().into_boxed_path()));
 
-            files
-                .entry(genre)
-                .and_modify(|x: &mut Vec<(PathBuf, Option<MfccData>)>| {
-                    x.push((audio_path.clone(), data.clone()))
-                })
-                .or_insert(vec![(audio_path.clone(), data)]);
+                let audio = Audio { data };
+
+                files
+                    .entry(genre)
+                    .and_modify(|x: &mut Vec<Audio>| x.push(audio.clone()))
+                    .or_insert(vec![audio]);
+            }
         }
     }
 
