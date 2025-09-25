@@ -1,13 +1,17 @@
 [package]
-name = "ai"
+name = "curieux"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
 bincode = "2.0.1"
-burn = { version = "0.18.0", features=["ndarray", "train", "autodiff", "dataset", "wgpu"] }
-mfcc = { version = "0.1.0", path = "mfcc" }
+burn = { version = "0.18.0", features=["train", "autodiff", "dataset", "vulkan", "openblas-system"] }
+burn-candle = "0.18.0"
+mel_spec = "0.3.3"
+ndarray = "0.16.1"
+num-complex = "0.4.6"
 rand = "0.9.2"
+rustfft = "6.4.0"
 serde = { version = "1.0.219", features = ["derive"] }
 symphonia = "0.5.4"
 toml = "0.9.5"

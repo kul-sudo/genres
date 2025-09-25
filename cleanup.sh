@@ -1,1 +1,1 @@
-rm -rf artifact items items.bin
+rm -rf artifact cache.bin cache

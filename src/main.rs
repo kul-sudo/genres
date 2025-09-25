@@ -1,35 +1,24 @@
 #![recursion_limit = "256"]
 mod audio;
 mod consts;
+mod files;
 mod genre;
-mod lazy_init;
-mod params;
+mod model;
 
-use audio::{MfccData, MfccSource};
-use bincode::{Decode, Encode, config::standard, decode_from_std_read, encode_into_std_write};
-use burn::tensor::activation::softmax;
+use audio::*;
+use bincode::{config::standard, decode_from_std_read, encode_into_std_write};
 use burn::{
-    backend::{Autodiff, Wgpu, wgpu::WgpuDevice},
+    backend::wgpu::WgpuDevice,
     config::Config,
-    data::{
-        dataloader::{DataLoaderBuilder, batcher::Batcher},
-        dataset::InMemDataset,
-    },
+    data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
+    grad_clipping::GradientClippingConfig,
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
-    nn::{
-        BiLstm, BiLstmConfig, Dropout, DropoutConfig, Linear, LinearConfig,
-        loss::CrossEntropyLossConfig,
-    },
-    optim::AdamConfig,
+    optim::AdamWConfig,
     record::CompactRecorder,
-    tensor::{
-        ElementConversion, Int, Tensor, TensorData,
-        activation::gelu,
-        backend::{AutodiffBackend, Backend},
-    },
+    tensor::backend::AutodiffBackend,
     train::{
-        ClassificationOutput, LearnerBuilder, TrainOutput, TrainStep, ValidStep,
+        LearnerBuilder,
         checkpoint::MetricCheckpointingStrategy,
         metric::{
             AccuracyMetric, LossMetric,
@@ -38,166 +27,21 @@ use burn::{
     },
 };
 use consts::*;
-use genre::*;
-use lazy_init::*;
+use files::*;
+use model::*;
 use rand::{rng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
-    collections::HashMap,
-    fs::{File, create_dir, exists, read_dir, read_to_string},
+    fs::{File, exists, read_to_string},
     io::{BufReader, BufWriter},
-    mem::transmute,
-    path::{Path, PathBuf},
+    path::Path,
 };
 use toml::from_str;
-
-type MyAutodiffBackend = Autodiff<Wgpu<f32, i32>>;
-
-#[derive(Module, Debug)]
-pub struct Network<B: Backend> {
-    lstm1: BiLstm<B>,
-    dropout1: Dropout,
-    linear1: Linear<B>,
-    linear2: Linear<B>,
-}
-
-#[derive(Config, Debug)]
-pub struct NetworkConfig {
-    input_features: usize,
-    output_features: usize,
-}
-
-impl NetworkConfig {
-    pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
-        Network {
-            lstm1: BiLstmConfig::new(self.input_features, 64, true).init(device),
-            dropout1: DropoutConfig::new(0.3).init(),
-            linear1: LinearConfig::new(128, 128).init(device),
-            linear2: LinearConfig::new(128, self.output_features).init(device),
-        }
-    }
-}
-
-impl<B: Backend> Network<B> {
-    pub fn forward(&self, input: Tensor<B, 2>) -> Tensor<B, 2> {
-        let input_size = N_COEFFS * 3;
-
-        let seq_len = MAX_SAMPLES_N / input_size;
-
-        let input_3d = input
-            .clone()
-            .reshape([input.dims()[0], seq_len, input_size]);
-
-        let (mut x, _) = self.lstm1.forward(input_3d, None);
-
-        let mut x = x.mean_dim(1).squeeze(1);
-        x = self.dropout1.forward(x);
-
-        x = gelu(self.linear1.forward(x));
-        x = self.linear2.forward(x);
-
-        x
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct AudioBatcher {}
-
-#[derive(Clone, Debug)]
-pub struct AudioBatch<B: Backend> {
-    pub images: Tensor<B, 2>,
-    pub targets: Tensor<B, 1, Int>,
-}
-
-#[derive(Clone, Debug, Encode, Decode)]
-pub struct AudioItem {
-    genre: Genre,
-    crop: PathBuf,
-}
-
-impl AudioItem {
-    pub fn get_items(items: &mut Vec<AudioItem>) {
-        for (genre, paths) in &*FILES {
-            for audio in paths {
-                if let Some(mfcc) = audio.data() {
-                    let mut b = mfcc.clone();
-                    b.normalize();
-                    let crop = b.save();
-                    items.push(AudioItem {
-                        genre: *genre,
-                        crop,
-                    });
-                }
-            }
-        }
-    }
-}
-
-impl<B: Backend> Batcher<B, AudioItem, AudioBatch<B>> for AudioBatcher {
-    fn batch(&self, items: Vec<AudioItem>, device: &B::Device) -> AudioBatch<B> {
-        let images = items
-            .iter()
-            .map(|item| {
-                let file = File::open(item.crop.clone()).unwrap();
-                let mut reader = BufReader::new(file);
-                let items: Vec<f64> = decode_from_std_read(&mut reader, standard()).unwrap();
-
-                TensorData::from(items.as_slice())
-            })
-            .map(|data| Tensor::<B, 1>::from_floats(data, device))
-            .map(|tensor| tensor.reshape([1, -1]))
-            .collect();
-
-        let targets = items
-            .iter()
-            .map(|item| {
-                Tensor::<B, 1, Int>::from_data(
-                    [(i64::from(item.genre)).elem::<B::IntElem>()],
-                    device,
-                )
-            })
-            .collect();
-
-        let images = Tensor::cat(images, 0);
-        let targets = Tensor::cat(targets, 0);
-
-        AudioBatch { images, targets }
-    }
-}
-
-impl<B: Backend> Network<B> {
-    pub fn forward_classification(
-        &self,
-        images: Tensor<B, 2>,
-        targets: Tensor<B, 1, Int>,
-    ) -> ClassificationOutput<B> {
-        let output = self.forward(images);
-        let loss = CrossEntropyLossConfig::new()
-            .init(&output.device())
-            .forward(output.clone(), targets.clone());
-
-        ClassificationOutput::new(loss, output, targets)
-    }
-}
-
-impl<B: AutodiffBackend> TrainStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B> {
-    fn step(&self, batch: AudioBatch<B>) -> TrainOutput<ClassificationOutput<B>> {
-        let item = self.forward_classification(batch.images, batch.targets);
-
-        TrainOutput::new(self, item.loss.backward(), item)
-    }
-}
-
-impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B> {
-    fn step(&self, batch: AudioBatch<B>) -> ClassificationOutput<B> {
-        self.forward_classification(batch.images, batch.targets)
-    }
-}
 
 #[derive(Config)]
 pub struct TrainingConfig {
     pub model: NetworkConfig,
-    pub optimizer: AdamConfig,
+    pub optimizer: AdamWConfig,
     #[config(default = 4000)]
     pub num_epochs: usize,
     #[config(default = 2)]
@@ -210,7 +54,7 @@ pub struct TrainingConfig {
 
 pub fn train<B: AutodiffBackend>(
     config: TrainingConfig,
-    items: &mut [AudioItem],
+    items: &mut [Vec<Crop>],
     device: B::Device,
 ) {
     B::seed(config.seed);
@@ -219,19 +63,23 @@ pub fn train<B: AutodiffBackend>(
 
     items.shuffle(&mut rng());
 
-    let threshold = (items.len() as f32 * PART_FOR_TRAINING) as usize;
+    let threshold = (items.len() as f32 * TRAINING_SPLIT) as usize;
     let (for_training, for_validation) = items.split_at(threshold);
 
     let dataloader_train = DataLoaderBuilder::new(batcher.clone())
         .batch_size(BATCH_SIZE)
         .shuffle(config.seed)
         .num_workers(config.num_workers)
-        .build(InMemDataset::new(for_training.to_vec()));
+        .build(InMemDataset::new(
+            for_training.iter().flatten().cloned().collect::<Vec<_>>(),
+        ));
 
     let dataloader_test = DataLoaderBuilder::new(batcher.clone())
         .batch_size(BATCH_SIZE)
         .num_workers(config.num_workers)
-        .build(InMemDataset::new(for_validation.to_vec()));
+        .build(InMemDataset::new(
+            for_validation.iter().flatten().cloned().collect::<Vec<_>>(),
+        ));
 
     let strategy = MetricCheckpointingStrategy::new(
         &AccuracyMetric::<B>::new(),
@@ -262,6 +110,7 @@ pub fn train<B: AutodiffBackend>(
         );
 
     let model_trained = learner.fit(dataloader_train, dataloader_test);
+
     model_trained
         .save_file(
             Path::new(ARTIFACT_DIR).join("model"),
@@ -282,25 +131,22 @@ struct TomlConfig {
 }
 
 pub fn main() {
-    if !exists(ITEMS_DIR).unwrap() {
-        create_dir(ITEMS_DIR).unwrap();
-    }
-
+    println!("{}", CROP_PAD as f32 / SAMPLE_RATE as f32);
     let data = read_to_string(CONFIG_FILE).unwrap();
 
     let config: TomlConfig = from_str(&data).unwrap();
 
     match config.mode {
         Mode::Train => {
-            let mut items = vec![];
+            let mut items;
 
-            if exists(ITEMS_FILE).unwrap() {
-                let file = File::open(ITEMS_FILE).unwrap();
+            if exists(CACHE_FILE).unwrap() {
+                let file = File::open(CACHE_FILE).unwrap();
                 let mut reader = BufReader::new(file);
                 items = decode_from_std_read(&mut reader, standard()).unwrap();
             } else {
-                AudioItem::get_items(&mut items);
-                let file = File::create(ITEMS_FILE).unwrap();
+                items = files_init();
+                let file = File::create(CACHE_FILE).unwrap();
                 let mut writer = BufWriter::new(file);
                 encode_into_std_write(&items, &mut writer, standard()).unwrap();
             }
@@ -309,62 +155,64 @@ pub fn main() {
 
             train::<MyAutodiffBackend>(
                 TrainingConfig::new(
-                    NetworkConfig::new(INPUT_SIZE, Genre::GENRES_N),
-                    AdamConfig::new(),
+                    NetworkConfig::new(),
+                    AdamWConfig::new()
+                        .with_weight_decay(1e-4)
+                        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0))),
                 ),
                 &mut items,
                 device,
             );
         }
         Mode::Test => {
-            let device = WgpuDevice::default();
-            let mut model = NetworkConfig::new(N_COEFFS * 3, Genre::GENRES_N)
-                .init::<MyAutodiffBackend>(&device);
-
-            model = model
-                .load_file(
-                    Path::new("models").join("model"),
-                    &CompactRecorder::new(),
-                    &device,
-                )
-                .unwrap();
-
-            for audio in read_dir("test").unwrap() {
-                let audio = audio.unwrap();
-                let audio_path = audio.path();
-
-                let data =
-                    MfccData::new(MfccSource::Path(audio_path.clone().into_boxed_path())).unwrap();
-
-                let mut frequencies = HashMap::with_capacity(ITERATIONS);
-
-                for _ in 0..ITERATIONS {
-                    let data = TensorData::from(data.data());
-                    let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
-                    let tensor = b.reshape([1, -1]);
-
-                    let a = model.forward(tensor);
-
-                    let genre_index = a.argmax(1).into_scalar() as u8;
-                    let genre = unsafe { transmute::<u8, Genre>(genre_index) };
-                    frequencies
-                        .entry(genre)
-                        .and_modify(|x| *x += 1)
-                        .or_insert(1);
-                }
-
-                let most_frequent = frequencies
-                    .into_iter()
-                    .max_by_key(|&(_, count)| count)
-                    .unwrap()
-                    .0;
-
-                println!(
-                    "{} {:?}",
-                    audio_path.file_name().unwrap().to_string_lossy(),
-                    most_frequent
-                );
-            }
+            // let device = WgpuDevice::default();
+            // let mut model = NetworkConfig::new().init::<MyAutodiffBackend>(&device);
+            //
+            // model = model
+            //     .load_file(
+            //         Path::new("models").join("model"),
+            //         &CompactRecorder::new(),
+            //         &device,
+            //     )
+            //     .unwrap();
+            //
+            // files_init();
+            //
+            // for audio in read_dir("test").unwrap() {
+            //     let audio = audio.unwrap();
+            //     let audio_path = audio.path();
+            //
+            //     let mut frequencies = HashMap::with_capacity(ITERATIONS);
+            //
+            //     for _ in 0..ITERATIONS {
+            //         let data = Crop::prepare(&audio_path).unwrap();
+            //
+            //         let data = TensorData::from(data.as_slice());
+            //         let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
+            //         let tensor = b.reshape([1, N_FRAMES, N_MELS]);
+            //
+            //         let a = model.forward(tensor);
+            //
+            //         let genre_index = a.argmax(1).into_scalar() as u8;
+            //         let genre = unsafe { transmute::<u8, Genre>(genre_index) };
+            //         frequencies
+            //             .entry(genre)
+            //             .and_modify(|x| *x += 1)
+            //             .or_insert(1);
+            //     }
+            //
+            //     let most_frequent = frequencies
+            //         .into_iter()
+            //         .max_by_key(|&(_, count)| count)
+            //         .unwrap()
+            //         .0;
+            //
+            //     println!(
+            //         "{} {:?}",
+            //         audio_path.file_name().unwrap().to_string_lossy(),
+            //         most_frequent
+            //     );
+            // }
         }
     }
 }
