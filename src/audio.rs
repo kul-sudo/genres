@@ -37,7 +37,7 @@ impl Crop {
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
         let mut hint = Hint::new();
-        hint.with_extension("wav");
+        hint.with_extension("ogg");
 
         let meta_opts: MetadataOptions = Default::default();
         let fmt_opts: FormatOptions = Default::default();
