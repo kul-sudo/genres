@@ -11,11 +11,11 @@ pub fn files_init() -> Vec<Vec<Crop>> {
         let genre = Genre::from_string(name.to_str().unwrap());
 
         for audio_entry in read_dir(&path).unwrap() {
-            let mut crops = Vec::with_capacity(CROPS_N.get());
+            let mut crops = Vec::with_capacity(N_CROPS.get());
             let audio_entry = audio_entry.unwrap();
             let audio_path = audio_entry.path();
 
-            for _ in 0..CROPS_N.get() {
+            for _ in 0..N_CROPS.get() {
                 if let Some(data) = Crop::prepare(&audio_path) {
                     crops.push(Crop::new(data, genre))
                 }

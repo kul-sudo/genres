@@ -131,7 +131,7 @@ struct TomlConfig {
 }
 
 pub fn main() {
-    println!("{}", CROP_PAD as f32 / SAMPLE_RATE as f32);
+    println!("{} {}", CROP_PAD, CROP_PAD as f32 / SAMPLE_RATE as f32);
     let data = read_to_string(CONFIG_FILE).unwrap();
 
     let config: TomlConfig = from_str(&data).unwrap();
