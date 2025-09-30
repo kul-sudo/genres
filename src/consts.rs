@@ -10,9 +10,10 @@ pub const ITERATIONS: usize = 5;
 pub const CONFIG_FILE: &str = "config.toml";
 pub const ARTIFACT_DIR: &str = "artifact";
 
-pub const FFT_SIZE: usize = 1024;
-pub const HOP_SIZE: usize = 64;
-pub const N_MELS: usize = 32;
-pub const N_FRAMES: usize = 256;
+pub const N_FILTERS: usize = 40;
+pub const N_COEFFS: usize = 20;
 
-pub const CROP_PAD: usize = (N_FRAMES - 1) * HOP_SIZE + FFT_SIZE;
+pub const MAX_SAMPLES_N: usize = (CROP_PAD / FRAME_SIZE) * (N_COEFFS * 3);
+const CROP_SECONDS: usize = 4; // More seconds may be read due to the presence "next_power_of_two"
+pub const FRAME_SIZE: usize = 2_usize.pow(10); // Ideally needs to be a power of two
+pub const CROP_PAD: usize = (SAMPLE_RATE * CROP_SECONDS).next_power_of_two();

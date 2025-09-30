@@ -3,7 +3,7 @@ use rand::{Rng, rng};
 use std::{fs::File, path::PathBuf};
 
 use bincode::{Decode, Encode};
-use mel_spec::{mel::MelSpectrogram, stft::Spectrogram};
+use mfcc::Transform;
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{CODEC_TYPE_NULL, DecoderOptions},
@@ -15,16 +15,16 @@ use symphonia::core::{
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct Crop {
-    data: Vec<f32>,
+    data: Vec<f64>,
     genre: Genre,
 }
 
 impl Crop {
-    pub fn new(data: Vec<f32>, genre: Genre) -> Crop {
+    pub fn new(data: Vec<f64>, genre: Genre) -> Crop {
         Crop { data, genre }
     }
 
-    pub fn data(&self) -> &[f32] {
+    pub fn data(&self) -> &[f64] {
         &self.data
     }
 
@@ -32,7 +32,7 @@ impl Crop {
         &self.genre
     }
 
-    pub fn prepare(source: &PathBuf) -> Option<Vec<f32>> {
+    pub fn prepare(source: &PathBuf) -> Option<Vec<f64>> {
         let src = File::open(source).unwrap();
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -102,22 +102,22 @@ impl Crop {
             *sample /= rms;
         }
 
-        let mut stft = Spectrogram::new(FFT_SIZE, HOP_SIZE);
-        let mut mel_transform = MelSpectrogram::new(FFT_SIZE, SAMPLE_RATE as f64, N_MELS);
+        let slice = slice
+            .iter()
+            .map(|sample| (sample * i16::MAX as f32) as i16)
+            .collect::<Vec<_>>();
 
-        let mut mel_spectrogram = Vec::new();
+        let mut state = Transform::new(SAMPLE_RATE, FRAME_SIZE).nfilters(N_COEFFS, N_FILTERS);
 
-        for chunk in slice.chunks(HOP_SIZE) {
-            if let Some(fft_frame) = stft.add(chunk) {
-                let mel_frame = mel_transform.add(&fft_frame);
-
-                mel_spectrogram.extend(mel_frame.iter().map(|&x| x as f32));
-            }
+        let mut all_mfccs = Vec::with_capacity(MAX_SAMPLES_N);
+        for chunk in slice.chunks_exact(FRAME_SIZE) {
+            let mut output = vec![0.0; N_COEFFS * 3];
+            state.transform(chunk, &mut output);
+            all_mfccs.extend_from_slice(&output);
         }
 
-        assert!(!mel_spectrogram.iter().any(|x: &f32| x.is_nan()));
-        assert_eq!(mel_spectrogram.len(), N_FRAMES * N_MELS);
+        assert_eq!(all_mfccs.len(), MAX_SAMPLES_N);
 
-        Some(mel_spectrogram)
+        Some(all_mfccs)
     }
 }
