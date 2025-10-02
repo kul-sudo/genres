@@ -5,8 +5,9 @@ use burn::{
     data::dataloader::batcher::Batcher,
     module::Module,
     nn::{
-        BiLstm, BiLstmConfig, Dropout, DropoutConfig, Linear, LinearConfig,
+        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
         attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig},
+        conv::{Conv1d, Conv1dConfig},
         loss::CrossEntropyLossConfig,
     },
     tensor::{
@@ -34,7 +35,7 @@ impl<B: Backend> Batcher<B, Crop, AudioBatch<B>> for AudioBatcher {
             .iter()
             .map(|item| TensorData::from(item.data()))
             .map(|data| Tensor::<B, 1>::from_floats(data, device))
-            .map(|tensor| tensor.reshape([1, MAX_SAMPLES_N / (N_COEFFS * 3), N_COEFFS * 3]))
+            .map(|tensor| tensor.reshape([1, N_COEFFS * 3, N_SEQS]))
             .collect();
 
         let targets = items
@@ -82,7 +83,7 @@ impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B
 
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
-    bilstm1: BiLstm<B>,
+    conv1d: Conv1d<B>,
     mha: MultiHeadAttention<B>,
     linear1: Linear<B>,
     dropout: Dropout,
@@ -95,27 +96,28 @@ pub struct NetworkConfig {}
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            bilstm1: BiLstmConfig::new(N_COEFFS * 3, 64, true).init(device),
+            conv1d: Conv1dConfig::new(N_COEFFS * 3, 128, 5)
+                .with_padding(PaddingConfig1d::Explicit(2))
+                .init(device),
             mha: MultiHeadAttentionConfig::new(128, 4)
                 .with_quiet_softmax(true)
                 .with_dropout(0.3)
                 .init(device),
-            linear1: LinearConfig::new(128, 64).init(device),
+            linear1: LinearConfig::new(128, 128).init(device),
             dropout: DropoutConfig::new(0.3).init(),
-            classifier: LinearConfig::new(64, Genre::GENRES_N).init(device),
+            classifier: LinearConfig::new(128, Genre::GENRES_N).init(device),
         }
     }
 }
 
 impl<B: Backend> Network<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
-        let (x, _) = self.bilstm1.forward(input, None);
-
+        let x = self.conv1d.forward(input);
+        let x = x.transpose();
         let mha_input = MhaInput::self_attn(x);
         let x = self.mha.forward(mha_input).context;
-
-        let x = gelu(self.linear1.forward(x));
         let x = x.mean_dim(1).squeeze(1);
+        let x = gelu(self.linear1.forward(x));
         let x = self.dropout.forward(x);
         self.classifier.forward(x)
     }
