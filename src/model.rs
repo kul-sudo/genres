@@ -83,7 +83,8 @@ impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B
 
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
-    conv1d: Conv1d<B>,
+    conv1: Conv1d<B>,
+    conv2: Conv1d<B>,
     mha: MultiHeadAttention<B>,
     linear1: Linear<B>,
     dropout: Dropout,
@@ -96,15 +97,18 @@ pub struct NetworkConfig {}
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            conv1d: Conv1dConfig::new(N_COEFFS * 3, 128, 5)
-                .with_padding(PaddingConfig1d::Explicit(2))
+            conv1: Conv1dConfig::new(N_COEFFS * 3, 64, 5)
+                .with_padding(PaddingConfig1d::Same)
+                .init(device),
+            conv2: Conv1dConfig::new(64, 128, 5)
+                .with_padding(PaddingConfig1d::Same)
                 .init(device),
             mha: MultiHeadAttentionConfig::new(128, 4)
                 .with_quiet_softmax(true)
                 .with_dropout(0.3)
                 .init(device),
             linear1: LinearConfig::new(128, 128).init(device),
-            dropout: DropoutConfig::new(0.3).init(),
+            dropout: DropoutConfig::new(0.5).init(),
             classifier: LinearConfig::new(128, Genre::GENRES_N).init(device),
         }
     }
@@ -112,7 +116,8 @@ impl NetworkConfig {
 
 impl<B: Backend> Network<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
-        let x = self.conv1d.forward(input);
+        let x = gelu(self.conv1.forward(input));
+        let x = gelu(self.conv2.forward(x));
         let x = x.transpose();
         let mha_input = MhaInput::self_attn(x);
         let x = self.mha.forward(mha_input).context;
