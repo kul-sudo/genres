@@ -6,7 +6,6 @@ use burn::{
     module::Module,
     nn::{
         Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
-        attention::{MhaInput, MultiHeadAttention, MultiHeadAttentionConfig},
         conv::{Conv1d, Conv1dConfig},
         loss::CrossEntropyLossConfig,
     },
@@ -60,6 +59,7 @@ impl<B: Backend> Network<B> {
     ) -> ClassificationOutput<B> {
         let output = self.forward(images);
         let loss = CrossEntropyLossConfig::new()
+            // .with_smoothing(Some(0.1))
             .init(&output.device())
             .forward(output.clone(), targets.clone());
 
@@ -85,9 +85,8 @@ impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B
 pub struct Network<B: Backend> {
     conv1: Conv1d<B>,
     conv2: Conv1d<B>,
-    mha: MultiHeadAttention<B>,
     linear1: Linear<B>,
-    dropout: Dropout,
+    dropout1: Dropout,
     classifier: Linear<B>,
 }
 
@@ -97,18 +96,14 @@ pub struct NetworkConfig {}
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            conv1: Conv1dConfig::new(N_COEFFS * 3, 64, 5)
+            conv1: Conv1dConfig::new(N_COEFFS * 3, 128, 5)
                 .with_padding(PaddingConfig1d::Same)
                 .init(device),
-            conv2: Conv1dConfig::new(64, 128, 5)
+            conv2: Conv1dConfig::new(128, 128, 5)
                 .with_padding(PaddingConfig1d::Same)
-                .init(device),
-            mha: MultiHeadAttentionConfig::new(128, 4)
-                .with_quiet_softmax(true)
-                .with_dropout(0.3)
                 .init(device),
             linear1: LinearConfig::new(128, 128).init(device),
-            dropout: DropoutConfig::new(0.5).init(),
+            dropout1: DropoutConfig::new(0.3).init(),
             classifier: LinearConfig::new(128, Genre::GENRES_N).init(device),
         }
     }
@@ -118,12 +113,9 @@ impl<B: Backend> Network<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
         let x = gelu(self.conv1.forward(input));
         let x = gelu(self.conv2.forward(x));
-        let x = x.transpose();
-        let mha_input = MhaInput::self_attn(x);
-        let x = self.mha.forward(mha_input).context;
-        let x = x.mean_dim(1).squeeze(1);
+        let x = x.mean_dim(2).squeeze(2);
         let x = gelu(self.linear1.forward(x));
-        let x = self.dropout.forward(x);
+        let x = self.dropout1.forward(x);
         self.classifier.forward(x)
     }
 }

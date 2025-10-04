@@ -11,7 +11,6 @@ use burn::{
     backend::wgpu::WgpuDevice,
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
-    grad_clipping::GradientClippingConfig,
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
     module::Module,
     optim::AdamWConfig,
@@ -21,7 +20,7 @@ use burn::{
         LearnerBuilder,
         checkpoint::MetricCheckpointingStrategy,
         metric::{
-            AccuracyMetric, LossMetric,
+            AccuracyMetric, CpuTemperature, LossMetric,
             store::{Aggregate, Direction, Split},
         },
     },
@@ -48,7 +47,7 @@ pub struct TrainingConfig {
     pub num_workers: usize,
     #[config(default = 42)]
     pub seed: u64,
-    #[config(default = 1.0e-4)]
+    #[config(default = 1e-4)]
     pub learning_rate: f64,
 }
 
@@ -96,6 +95,8 @@ pub fn train<B: AutodiffBackend>(
         .metric_valid_numeric(AccuracyMetric::new())
         .metric_train_numeric(LossMetric::new())
         .metric_valid_numeric(LossMetric::new())
+        .metric_train_numeric(CpuTemperature::new())
+        .metric_valid_numeric(CpuTemperature::new())
         .with_file_checkpointer(CompactRecorder::new())
         .with_checkpointing_strategy(strategy)
         .devices(vec![device.clone()])
@@ -131,7 +132,12 @@ struct TomlConfig {
 }
 
 pub fn main() {
-    println!("{} {}", CROP_PAD, CROP_PAD as f32 / SAMPLE_RATE as f32);
+    println!(
+        "{} {} {}",
+        MAX_SAMPLES_N,
+        CROP_PAD,
+        CROP_PAD as f32 / SAMPLE_RATE as f32
+    );
     let data = read_to_string(CONFIG_FILE).unwrap();
 
     let config: TomlConfig = from_str(&data).unwrap();
@@ -156,9 +162,7 @@ pub fn main() {
             train::<MyAutodiffBackend>(
                 TrainingConfig::new(
                     NetworkConfig::new(),
-                    AdamWConfig::new()
-                        .with_weight_decay(1e-4)
-                        .with_grad_clipping(Some(GradientClippingConfig::Norm(1.0))),
+                    AdamWConfig::new().with_weight_decay(1e-4),
                 ),
                 &mut items,
                 device,
