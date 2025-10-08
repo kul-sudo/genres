@@ -34,7 +34,7 @@ impl<B: Backend> Batcher<B, Crop, AudioBatch<B>> for AudioBatcher {
             .iter()
             .map(|item| TensorData::from(item.data()))
             .map(|data| Tensor::<B, 1>::from_floats(data, device))
-            .map(|tensor| tensor.reshape([1, N_COEFFS * 3, N_SEQS]))
+            .map(|tensor| tensor.reshape([1, N_COEFFS, N_SEQS]))
             .collect();
 
         let targets = items
@@ -59,7 +59,6 @@ impl<B: Backend> Network<B> {
     ) -> ClassificationOutput<B> {
         let output = self.forward(images);
         let loss = CrossEntropyLossConfig::new()
-            // .with_smoothing(Some(0.1))
             .init(&output.device())
             .forward(output.clone(), targets.clone());
 
@@ -96,14 +95,14 @@ pub struct NetworkConfig {}
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            conv1: Conv1dConfig::new(N_COEFFS * 3, 128, 5)
+            conv1: Conv1dConfig::new(N_COEFFS, 128, 5)
                 .with_padding(PaddingConfig1d::Same)
                 .init(device),
             conv2: Conv1dConfig::new(128, 128, 5)
                 .with_padding(PaddingConfig1d::Same)
                 .init(device),
             linear1: LinearConfig::new(128, 128).init(device),
-            dropout1: DropoutConfig::new(0.3).init(),
+            dropout1: DropoutConfig::new(0.5).init(),
             classifier: LinearConfig::new(128, Genre::GENRES_N).init(device),
         }
     }

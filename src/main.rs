@@ -15,7 +15,7 @@ use burn::{
     module::Module,
     optim::AdamWConfig,
     record::CompactRecorder,
-    tensor::backend::AutodiffBackend,
+    tensor::{Tensor, TensorData, backend::AutodiffBackend},
     train::{
         LearnerBuilder,
         checkpoint::MetricCheckpointingStrategy,
@@ -27,12 +27,15 @@ use burn::{
 };
 use consts::*;
 use files::*;
+use genre::*;
 use model::*;
 use rand::{rng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
-    fs::{File, exists, read_to_string},
+    collections::HashMap,
+    fs::{File, exists, read_dir, read_to_string},
     io::{BufReader, BufWriter},
+    mem::transmute,
     path::Path,
 };
 use toml::from_str;
@@ -132,6 +135,7 @@ struct TomlConfig {
 }
 
 pub fn main() {
+    // BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/aubio" cargo run --release
     println!(
         "{} {} {}",
         MAX_SAMPLES_N,
@@ -169,54 +173,54 @@ pub fn main() {
             );
         }
         Mode::Test => {
-            // let device = WgpuDevice::default();
-            // let mut model = NetworkConfig::new().init::<MyAutodiffBackend>(&device);
-            //
-            // model = model
-            //     .load_file(
-            //         Path::new("models").join("model"),
-            //         &CompactRecorder::new(),
-            //         &device,
-            //     )
-            //     .unwrap();
-            //
-            // files_init();
-            //
-            // for audio in read_dir("test").unwrap() {
-            //     let audio = audio.unwrap();
-            //     let audio_path = audio.path();
-            //
-            //     let mut frequencies = HashMap::with_capacity(ITERATIONS);
-            //
-            //     for _ in 0..ITERATIONS {
-            //         let data = Crop::prepare(&audio_path).unwrap();
-            //
-            //         let data = TensorData::from(data.as_slice());
-            //         let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
-            //         let tensor = b.reshape([1, N_FRAMES, N_MELS]);
-            //
-            //         let a = model.forward(tensor);
-            //
-            //         let genre_index = a.argmax(1).into_scalar() as u8;
-            //         let genre = unsafe { transmute::<u8, Genre>(genre_index) };
-            //         frequencies
-            //             .entry(genre)
-            //             .and_modify(|x| *x += 1)
-            //             .or_insert(1);
-            //     }
-            //
-            //     let most_frequent = frequencies
-            //         .into_iter()
-            //         .max_by_key(|&(_, count)| count)
-            //         .unwrap()
-            //         .0;
-            //
-            //     println!(
-            //         "{} {:?}",
-            //         audio_path.file_name().unwrap().to_string_lossy(),
-            //         most_frequent
-            //     );
-            // }
+            let device = WgpuDevice::default();
+            let mut model = NetworkConfig::new().init::<MyAutodiffBackend>(&device);
+
+            model = model
+                .load_file(
+                    Path::new("models").join("model"),
+                    &CompactRecorder::new(),
+                    &device,
+                )
+                .unwrap();
+
+            for audio in read_dir("test").unwrap() {
+                let audio = audio.unwrap();
+                let audio_path = audio.path();
+
+                let mut frequencies = HashMap::with_capacity(ITERATIONS);
+
+                for _ in 0..ITERATIONS {
+                    let variations = Crop::prepare(&audio_path).unwrap();
+
+                    for variation in variations {
+                        let data = TensorData::from(variation.as_slice());
+                        let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
+                        let tensor = b.reshape([1, N_COEFFS, N_SEQS]);
+
+                        let a = model.forward(tensor);
+
+                        let genre_index = a.argmax(1).into_scalar() as u8;
+                        let genre = unsafe { transmute::<u8, Genre>(genre_index) };
+                        frequencies
+                            .entry(genre)
+                            .and_modify(|x| *x += 1)
+                            .or_insert(1);
+                    }
+                }
+
+                let most_frequent = frequencies
+                    .into_iter()
+                    .max_by_key(|&(_, count)| count)
+                    .unwrap()
+                    .0;
+
+                println!(
+                    "{} {:?}",
+                    audio_path.file_name().unwrap().to_string_lossy(),
+                    most_frequent
+                );
+            }
         }
     }
 }

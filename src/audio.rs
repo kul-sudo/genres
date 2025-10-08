@@ -2,8 +2,11 @@ use crate::{consts::*, genre::*};
 use rand::{Rng, rng};
 use std::{fs::File, path::PathBuf};
 
+use aubio::{MFCC, PVoc, carr, farr};
 use bincode::{Decode, Encode};
-use mfcc::Transform;
+use hound::{SampleFormat, WavSpec, WavWriter};
+use pitch_shift::PitchShifter;
+use reverb::Reverb;
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{CODEC_TYPE_NULL, DecoderOptions},
@@ -15,16 +18,16 @@ use symphonia::core::{
 
 #[derive(Clone, Debug, Encode, Decode)]
 pub struct Crop {
-    data: Vec<f64>,
+    data: Vec<f32>,
     genre: Genre,
 }
 
 impl Crop {
-    pub fn new(data: Vec<f64>, genre: Genre) -> Crop {
+    pub fn new(data: Vec<f32>, genre: Genre) -> Crop {
         Crop { data, genre }
     }
 
-    pub fn data(&self) -> &[f64] {
+    pub fn data(&self) -> &[f32] {
         &self.data
     }
 
@@ -32,7 +35,7 @@ impl Crop {
         &self.genre
     }
 
-    pub fn prepare(source: &PathBuf) -> Option<Vec<f64>> {
+    pub fn prepare(source: &PathBuf) -> Option<Vec<Vec<f32>>> {
         let src = File::open(source).unwrap();
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -97,27 +100,77 @@ impl Crop {
         let crop_start = rng().random_range(0..samples.len() - CROP_PAD);
         let slice = &mut samples[crop_start..crop_start + CROP_PAD];
 
-        let rms = (slice.iter().map(|x| x.powi(2)).sum::<f32>() / slice.len() as f32 + 1e-8).sqrt();
-        for sample in slice.iter_mut() {
-            *sample /= rms;
+        let mut variations = Vec::with_capacity(N_VARIATIONS + 1);
+
+        for _ in 0..N_VARIATIONS {
+            let mut shifter = PitchShifter::new(50, SAMPLE_RATE);
+            let semitones = rng().random_range(SEMITONE_VARIANCE);
+            let mut shifted = vec![0.0; slice.len()];
+            shifter.shift_pitch(16, semitones, slice, &mut shifted);
+
+            if rng().random_range(0.0..=1.0) < DISTORTION_CHANCE {
+                let mut reverb = Reverb::new();
+                reverb.decay(DECAY).damping(DAMPING).bandwidth(BANDWIDTH);
+
+                let dry_level = rng().random_range(DRY_RANGE);
+                let wet_level = rng().random_range(WET_RANGE);
+
+                for sample in shifted.iter_mut() {
+                    let wet_sample = reverb.calc_sample(*sample, wet_level);
+                    *sample = *sample * dry_level + wet_sample;
+                }
+
+                for sample in shifted.iter_mut() {
+                    *sample += rng().random_range(-NOISE_LEVEL..NOISE_LEVEL);
+                }
+            }
+
+            variations.push(process(&mut shifted));
         }
 
-        let slice = slice
-            .iter()
-            .map(|sample| (sample * i16::MAX as f32) as i16)
-            .collect::<Vec<_>>();
+        variations.push(process(slice));
 
-        let mut state = Transform::new(SAMPLE_RATE, FRAME_SIZE).nfilters(N_COEFFS, N_FILTERS);
-
-        let mut all_mfccs = Vec::with_capacity(MAX_SAMPLES_N);
-        for chunk in slice.chunks_exact(FRAME_SIZE) {
-            let mut output = vec![0.0; N_COEFFS * 3];
-            state.transform(chunk, &mut output);
-            all_mfccs.extend_from_slice(&output);
-        }
-
-        assert_eq!(all_mfccs.len(), MAX_SAMPLES_N);
-
-        Some(all_mfccs)
+        Some(variations)
     }
+}
+
+fn save_wav(path: &str, samples: &[f32], sample_rate: u32) {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 32,
+        sample_format: SampleFormat::Float,
+    };
+    let mut writer = WavWriter::create(path, spec).unwrap();
+    for &sample in samples {
+        writer.write_sample(sample).unwrap();
+    }
+    writer.finalize().unwrap();
+}
+
+fn process(input: &mut [f32]) -> Vec<f32> {
+    let rms = (input.iter().map(|x| x.powi(2)).sum::<f32>() / input.len() as f32 + 1e-8).sqrt();
+    for sample in input.iter_mut() {
+        *sample /= rms;
+    }
+
+    assert!(input.len() >= FRAME_SIZE);
+
+    let mut pvoc = PVoc::new(FRAME_SIZE, HOP_LENGTH).unwrap();
+    let mut mfcc = MFCC::new(FRAME_SIZE, N_FILTERS, N_COEFFS, SAMPLE_RATE as u32)
+        .unwrap()
+        .with_mel_coeffs_slaney();
+
+    let mut fftgrain = carr!(FRAME_SIZE);
+    let mut mfcc_out = farr!(N_COEFFS);
+    let mut all_mfccs = Vec::with_capacity(MAX_SAMPLES_N);
+
+    for chunk in input.chunks_exact(HOP_LENGTH) {
+        pvoc.do_(chunk, &mut fftgrain).unwrap();
+        mfcc.do_(fftgrain, &mut mfcc_out).unwrap();
+        all_mfccs.extend_from_slice(mfcc_out.as_slice());
+    }
+
+    assert_eq!(all_mfccs.len(), MAX_SAMPLES_N);
+    all_mfccs
 }

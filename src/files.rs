@@ -16,8 +16,10 @@ pub fn files_init() -> Vec<Vec<Crop>> {
             let audio_path = audio_entry.path();
 
             for _ in 0..N_CROPS.get() {
-                if let Some(data) = Crop::prepare(&audio_path) {
-                    crops.push(Crop::new(data, genre))
+                if let Some(variations) = Crop::prepare(&audio_path) {
+                    for variation in variations {
+                        crops.push(Crop::new(variation, genre))
+                    }
                 }
             }
 
