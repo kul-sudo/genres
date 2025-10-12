@@ -5,7 +5,8 @@ use burn::{
     data::dataloader::batcher::Batcher,
     module::Module,
     nn::{
-        Dropout, DropoutConfig, Linear, LinearConfig, PaddingConfig1d,
+        Dropout, DropoutConfig, InstanceNorm, InstanceNormConfig, Linear, LinearConfig,
+        PaddingConfig1d,
         conv::{Conv1d, Conv1dConfig},
         loss::CrossEntropyLossConfig,
     },
@@ -83,7 +84,9 @@ impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
     conv1: Conv1d<B>,
+    bn1: InstanceNorm<B>,
     conv2: Conv1d<B>,
+    bn2: InstanceNorm<B>,
     linear1: Linear<B>,
     dropout1: Dropout,
     classifier: Linear<B>,
@@ -98,9 +101,11 @@ impl NetworkConfig {
             conv1: Conv1dConfig::new(N_COEFFS, 128, 5)
                 .with_padding(PaddingConfig1d::Same)
                 .init(device),
+            bn1: InstanceNormConfig::new(128).init(device),
             conv2: Conv1dConfig::new(128, 128, 5)
                 .with_padding(PaddingConfig1d::Same)
                 .init(device),
+            bn2: InstanceNormConfig::new(128).init(device),
             linear1: LinearConfig::new(128, 128).init(device),
             dropout1: DropoutConfig::new(0.5).init(),
             classifier: LinearConfig::new(128, Genre::GENRES_N).init(device),
@@ -110,8 +115,12 @@ impl NetworkConfig {
 
 impl<B: Backend> Network<B> {
     pub fn forward(&self, input: Tensor<B, 3>) -> Tensor<B, 2> {
-        let x = gelu(self.conv1.forward(input));
-        let x = gelu(self.conv2.forward(x));
+        let x = self.conv1.forward(input);
+        let x = self.bn1.forward(x);
+        let x = gelu(x);
+        let x = self.conv2.forward(x);
+        let x = self.bn2.forward(x);
+        let x = gelu(x);
         let x = x.mean_dim(2).squeeze(2);
         let x = gelu(self.linear1.forward(x));
         let x = self.dropout1.forward(x);

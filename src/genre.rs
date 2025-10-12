@@ -3,18 +3,18 @@ use bincode::{Decode, Encode};
 #[derive(Copy, Clone, Debug, Encode, Decode, PartialEq, Eq, Hash)]
 pub enum Genre {
     Rock,
-    HipHop,
     Electronic,
     Classical,
+    Jazz,
 }
 
 impl Genre {
     pub fn from_string(string: &str) -> Genre {
         match string {
             "rock" => Genre::Rock,
-            "hiphop" => Genre::HipHop,
             "electronic" => Genre::Electronic,
             "classical" => Genre::Classical,
+            "jazz" => Genre::Jazz,
             _ => panic!("Unexpected genre."),
         }
     }
@@ -22,9 +22,9 @@ impl Genre {
     pub fn index(&self) -> u32 {
         match self {
             Genre::Rock => 0,
-            Genre::HipHop => 1,
-            Genre::Electronic => 2,
-            Genre::Classical => 3,
+            Genre::Electronic => 1,
+            Genre::Classical => 2,
+            Genre::Jazz => 3,
         }
     }
 }

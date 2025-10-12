@@ -333,6 +333,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "biquad"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8580925877eb35ab50f987a1c2c193eb46000c8827c871bc3425070f086408cc"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
 name = "bit-set"
 version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1529,6 +1538,7 @@ version = "0.1.0"
 dependencies = [
  "aubio",
  "bincode",
+ "biquad",
  "burn",
  "burn-candle",
  "hound",
@@ -1536,7 +1546,6 @@ dependencies = [
  "num-complex",
  "pitch_shift",
  "rand 0.9.2",
- "reverb",
  "rustfft",
  "serde",
  "symphonia",
@@ -4429,12 +4438,6 @@ name = "renderdoc-sys"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19b30a45b0cd0bcca8037f3d0dc3421eaf95327a17cad11964fb8179b4fc4832"
-
-[[package]]
-name = "reverb"
-version = "1.0.47"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd3b8aaccb0168a5e793c8727141ab9a084f0487d40080a8bee93652dd5375ea"
 
 [[package]]
 name = "rgb"

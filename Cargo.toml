@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 aubio = { version = "0.2.1", features=["bindgen", "pkg-config"] }
 bincode = "2.0.1"
+biquad = "0.5.0"
 burn = { version = "0.18.0", features=["train", "autodiff", "dataset", "vulkan", "openblas-system"] }
 burn-candle = "0.18.0"
 hound = "3.5.1"
@@ -13,7 +14,6 @@ ndarray = "0.15.6"
 num-complex = "0.4.6"
 pitch_shift = "1.0.0"
 rand = "0.9.2"
-reverb = "1.0.47"
 rustfft = "6.4.0"
 serde = { version = "1.0.219", features = ["derive"] }
 symphonia = "0.5.4"

@@ -4,9 +4,9 @@ use std::{fs::File, path::PathBuf};
 
 use aubio::{MFCC, PVoc, carr, farr};
 use bincode::{Decode, Encode};
-use hound::{SampleFormat, WavSpec, WavWriter};
+use biquad::{Biquad, Coefficients, DirectForm2Transposed, Q_BUTTERWORTH_F32, ToHertz, Type};
+// use hound::{SampleFormat, WavSpec, WavWriter};
 use pitch_shift::PitchShifter;
-use reverb::Reverb;
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{CODEC_TYPE_NULL, DecoderOptions},
@@ -35,7 +35,7 @@ impl Crop {
         &self.genre
     }
 
-    pub fn prepare(source: &PathBuf) -> Option<Vec<Vec<f32>>> {
+    pub fn prepare(source: &PathBuf, testing: bool) -> Option<Vec<Vec<f32>>> {
         let src = File::open(source).unwrap();
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -98,62 +98,109 @@ impl Crop {
         assert!(samples.len() >= CROP_PAD);
 
         let crop_start = rng().random_range(0..samples.len() - CROP_PAD);
-        let slice = &mut samples[crop_start..crop_start + CROP_PAD];
+        let slice: [f32; CROP_PAD] = samples[crop_start..crop_start + CROP_PAD]
+            .try_into()
+            .unwrap();
 
-        let mut variations = Vec::with_capacity(N_VARIATIONS + 1);
+        let mut variations = vec![];
 
-        for _ in 0..N_VARIATIONS {
-            let mut shifter = PitchShifter::new(50, SAMPLE_RATE);
-            let semitones = rng().random_range(SEMITONE_VARIANCE);
-            let mut shifted = vec![0.0; slice.len()];
-            shifter.shift_pitch(16, semitones, slice, &mut shifted);
+        let mut local = slice;
+        let mut applied = false;
 
-            if rng().random_range(0.0..=1.0) < DISTORTION_CHANCE {
-                let mut reverb = Reverb::new();
-                reverb.decay(DECAY).damping(DAMPING).bandwidth(BANDWIDTH);
-
-                let dry_level = rng().random_range(DRY_RANGE);
-                let wet_level = rng().random_range(WET_RANGE);
-
-                for sample in shifted.iter_mut() {
-                    let wet_sample = reverb.calc_sample(*sample, wet_level);
-                    *sample = *sample * dry_level + wet_sample;
-                }
-
-                for sample in shifted.iter_mut() {
-                    *sample += rng().random_range(-NOISE_LEVEL..NOISE_LEVEL);
-                }
+        if testing {
+            if rng().random_range(0.0..=1.0) < LOFI_CHANCE_TESTING {
+                lofi(&mut local);
+                applied = true;
             }
 
-            variations.push(process(&mut shifted));
+            if rng().random_range(0.0..=1.0) < PITCH_SHIFT_CHANCE_TESTING {
+                p_shift(&mut local);
+                applied = true;
+            }
+        } else {
+            if rng().random_range(0.0..=1.0) < LOFI_CHANCE_TRAINING {
+                lofi(&mut local);
+                applied = true;
+            }
+
+            if rng().random_range(0.0..=1.0) < PITCH_SHIFT_CHANCE_TRAINING {
+                p_shift(&mut local);
+                applied = true;
+            }
         }
 
-        variations.push(process(slice));
+        // save_wav(
+        //     source.file_name().unwrap().to_str().unwrap(),
+        //     &local,
+        //     SAMPLE_RATE as u32,
+        // );
+
+        if applied {
+            variations.push(process(&local));
+        }
+
+        variations.push(process(&slice));
 
         Some(variations)
     }
 }
 
-fn save_wav(path: &str, samples: &[f32], sample_rate: u32) {
-    let spec = WavSpec {
-        channels: 1,
-        sample_rate,
-        bits_per_sample: 32,
-        sample_format: SampleFormat::Float,
-    };
-    let mut writer = WavWriter::create(path, spec).unwrap();
-    for &sample in samples {
-        writer.write_sample(sample).unwrap();
-    }
-    writer.finalize().unwrap();
+fn p_shift(input: &mut [f32; CROP_PAD]) {
+    let mut shifter = PitchShifter::new(50, SAMPLE_RATE);
+    let mut output = [0.0; CROP_PAD];
+    shifter.shift_pitch(
+        16,
+        rng().random_range(PITCH_SHIFT_RANGE),
+        input,
+        &mut output,
+    );
+    *input = output;
 }
 
-fn process(input: &mut [f32]) -> Vec<f32> {
-    let rms = (input.iter().map(|x| x.powi(2)).sum::<f32>() / input.len() as f32 + 1e-8).sqrt();
-    for sample in input.iter_mut() {
-        *sample /= rms;
-    }
+fn lofi(input: &mut [f32; CROP_PAD]) {
+    let mut hpf = DirectForm2Transposed::<f32>::new(
+        Coefficients::<f32>::from_params(
+            Type::HighPass,
+            SAMPLE_RATE.hz(),
+            HIGH_PASS.hz(),
+            Q_BUTTERWORTH_F32,
+        )
+        .unwrap(),
+    );
 
+    let mut lpf = DirectForm2Transposed::<f32>::new(
+        Coefficients::<f32>::from_params(
+            Type::LowPass,
+            SAMPLE_RATE.hz(),
+            LOW_PASS.hz(),
+            Q_BUTTERWORTH_F32,
+        )
+        .unwrap(),
+    );
+
+    for sample in input.iter_mut() {
+        *sample = hpf.run(*sample);
+        *sample = lpf.run(*sample);
+        *sample = sample.clamp(-CLAMP_LEVEL, CLAMP_LEVEL);
+        *sample += rng().random_range(-NOISE_LEVEL..NOISE_LEVEL);
+    }
+}
+
+// fn save_wav(path: &str, samples: &[f32], sample_rate: u32) {
+//     let spec = WavSpec {
+//         channels: 1,
+//         sample_rate,
+//         bits_per_sample: 32,
+//         sample_format: SampleFormat::Float,
+//     };
+//     let mut writer = WavWriter::create(path, spec).unwrap();
+//     for &sample in samples {
+//         writer.write_sample(sample).unwrap();
+//     }
+//     writer.finalize().unwrap();
+// }
+
+fn process(input: &[f32; CROP_PAD]) -> Vec<f32> {
     assert!(input.len() >= FRAME_SIZE);
 
     let mut pvoc = PVoc::new(FRAME_SIZE, HOP_LENGTH).unwrap();
@@ -165,7 +212,8 @@ fn process(input: &mut [f32]) -> Vec<f32> {
     let mut mfcc_out = farr!(N_COEFFS);
     let mut all_mfccs = Vec::with_capacity(MAX_SAMPLES_N);
 
-    for chunk in input.chunks_exact(HOP_LENGTH) {
+    let rms = (input.iter().map(|x| x.powi(2)).sum::<f32>() / input.len() as f32 + 1e-8).sqrt();
+    for chunk in input.map(|sample| sample / rms).chunks_exact(HOP_LENGTH) {
         pvoc.do_(chunk, &mut fftgrain).unwrap();
         mfcc.do_(fftgrain, &mut mfcc_out).unwrap();
         all_mfccs.extend_from_slice(mfcc_out.as_slice());

@@ -33,6 +33,7 @@ use rand::{rng, seq::SliceRandom};
 use serde::Deserialize;
 use std::{
     collections::HashMap,
+    env::var,
     fs::{File, exists, read_dir, read_to_string},
     io::{BufReader, BufWriter},
     mem::transmute,
@@ -173,15 +174,13 @@ pub fn main() {
             );
         }
         Mode::Test => {
+            let path = var("MODEL").unwrap();
+
             let device = WgpuDevice::default();
             let mut model = NetworkConfig::new().init::<MyAutodiffBackend>(&device);
 
             model = model
-                .load_file(
-                    Path::new("models").join("model"),
-                    &CompactRecorder::new(),
-                    &device,
-                )
+                .load_file(path, &CompactRecorder::new(), &device)
                 .unwrap();
 
             for audio in read_dir("test").unwrap() {
@@ -191,7 +190,7 @@ pub fn main() {
                 let mut frequencies = HashMap::with_capacity(ITERATIONS);
 
                 for _ in 0..ITERATIONS {
-                    let variations = Crop::prepare(&audio_path).unwrap();
+                    let variations = Crop::prepare(&audio_path, true).unwrap();
 
                     for variation in variations {
                         let data = TensorData::from(variation.as_slice());
