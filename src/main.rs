@@ -79,6 +79,7 @@ pub fn train<B: AutodiffBackend>(
 
     let dataloader_test = DataLoaderBuilder::new(batcher.clone())
         .batch_size(BATCH_SIZE)
+        .shuffle(config.seed)
         .num_workers(config.num_workers)
         .build(InMemDataset::new(
             for_validation.iter().flatten().cloned().collect::<Vec<_>>(),
@@ -208,16 +209,14 @@ pub fn main() {
                     }
                 }
 
-                let most_frequent = frequencies
-                    .into_iter()
-                    .max_by_key(|&(_, count)| count)
-                    .unwrap()
-                    .0;
+                let mut freq_vec: Vec<(Genre, u32)> = frequencies.into_iter().collect();
+                freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                let top_two = &freq_vec[..freq_vec.len().min(2)];
 
                 println!(
                     "{} {:?}",
                     audio_path.file_name().unwrap().to_string_lossy(),
-                    most_frequent
+                    top_two
                 );
             }
         }

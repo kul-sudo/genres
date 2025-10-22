@@ -4,8 +4,8 @@ use bincode::{Decode, Encode};
 pub enum Genre {
     Rock,
     Electronic,
+    Rap,
     Classical,
-    Jazz,
 }
 
 impl Genre {
@@ -13,8 +13,8 @@ impl Genre {
         match string {
             "rock" => Genre::Rock,
             "electronic" => Genre::Electronic,
+            "rap" => Genre::Rap,
             "classical" => Genre::Classical,
-            "jazz" => Genre::Jazz,
             _ => panic!("Unexpected genre."),
         }
     }
@@ -23,8 +23,8 @@ impl Genre {
         match self {
             Genre::Rock => 0,
             Genre::Electronic => 1,
-            Genre::Classical => 2,
-            Genre::Jazz => 3,
+            Genre::Rap => 2,
+            Genre::Classical => 3,
         }
     }
 }
