@@ -1,5 +1,2 @@
-[env]
-BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/aubio"
-
 [build]
-rustflags = ["-C", "target-cpu=native", "-C", "link-arg=-fuse-ld=mold"]
+rustflags = ["-C", "target-cpu=native"]

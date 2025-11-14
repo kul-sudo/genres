@@ -1,11 +1,7 @@
 /target
-artifact
-genres
-test
-artifact*
-models
-items
-latest
-input
+/input
+/test
 cache.bin
-options
+experiment.log
+valid/
+train/

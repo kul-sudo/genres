@@ -1,14 +1,14 @@
-#![recursion_limit = "256"]
 mod audio;
 mod consts;
 mod files;
 mod genre;
+mod layers;
 mod model;
 
 use audio::*;
 use bincode::{config::standard, decode_from_std_read, encode_into_std_write};
 use burn::{
-    backend::wgpu::WgpuDevice,
+    backend::{cuda::CudaDevice, ndarray::NdArrayDevice},
     config::Config,
     data::{dataloader::DataLoaderBuilder, dataset::InMemDataset},
     lr_scheduler::cosine::CosineAnnealingLrSchedulerConfig,
@@ -17,8 +17,8 @@ use burn::{
     record::CompactRecorder,
     tensor::{Tensor, TensorData, backend::AutodiffBackend},
     train::{
-        LearnerBuilder,
-        checkpoint::MetricCheckpointingStrategy,
+        LearnerBuilder, LearningStrategy,
+        checkpoint::{ComposedCheckpointingStrategy, MetricCheckpointingStrategy},
         metric::{
             AccuracyMetric, CpuTemperature, LossMetric,
             store::{Aggregate, Direction, Split},
@@ -35,13 +35,15 @@ use std::{
     collections::HashMap,
     env::var,
     fs::{File, exists, read_dir, read_to_string},
+    io::Write,
     io::{BufReader, BufWriter},
     mem::transmute,
     path::Path,
+    sync::LazyLock,
 };
 use toml::from_str;
 
-#[derive(Config)]
+#[derive(Debug, Config)]
 pub struct TrainingConfig {
     pub model: NetworkConfig,
     pub optimizer: AdamWConfig,
@@ -53,6 +55,8 @@ pub struct TrainingConfig {
     pub seed: u64,
     #[config(default = 1e-4)]
     pub learning_rate: f64,
+    #[config(default = 8)]
+    pub batch_size: usize,
 }
 
 pub fn train<B: AutodiffBackend>(
@@ -60,40 +64,25 @@ pub fn train<B: AutodiffBackend>(
     items: &mut [Vec<Crop>],
     device: B::Device,
 ) {
-    B::seed(config.seed);
-
-    let batcher = AudioBatcher::default();
+    B::seed(&device, config.seed);
 
     items.shuffle(&mut rng());
 
     let threshold = (items.len() as f32 * TRAINING_SPLIT) as usize;
-    let (for_training, for_validation) = items.split_at(threshold);
+    let (for_training, for_validation) = items.split_at_mut(threshold);
 
-    let dataloader_train = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(BATCH_SIZE)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
-        .build(InMemDataset::new(
-            for_training.iter().flatten().cloned().collect::<Vec<_>>(),
-        ));
-
-    let dataloader_test = DataLoaderBuilder::new(batcher.clone())
-        .batch_size(BATCH_SIZE)
-        .shuffle(config.seed)
-        .num_workers(config.num_workers)
-        .build(InMemDataset::new(
-            for_validation.iter().flatten().cloned().collect::<Vec<_>>(),
-        ));
-
-    let strategy = MetricCheckpointingStrategy::new(
-        &AccuracyMetric::<B>::new(),
-        Aggregate::Mean,
-        Direction::Highest,
-        Split::Valid,
-    );
-
-    let steps_per_epoch = for_training.len().div_ceil(BATCH_SIZE);
+    let steps_per_epoch = for_training.len().div_ceil(config.batch_size);
     let total_steps = steps_per_epoch * config.num_epochs;
+
+    let (mean, std) = compute_global_stats(for_training);
+
+    for split in [&mut for_training[..], &mut for_validation[..]] {
+        for crops in split {
+            for crop in crops {
+                crop.normalize(mean, std);
+            }
+        }
+    }
 
     let learner = LearnerBuilder::new(ARTIFACT_DIR)
         .metric_train_numeric(AccuracyMetric::new())
@@ -103,8 +92,17 @@ pub fn train<B: AutodiffBackend>(
         .metric_train_numeric(CpuTemperature::new())
         .metric_valid_numeric(CpuTemperature::new())
         .with_file_checkpointer(CompactRecorder::new())
-        .with_checkpointing_strategy(strategy)
-        .devices(vec![device.clone()])
+        .with_checkpointing_strategy(
+            ComposedCheckpointingStrategy::builder()
+                .add(MetricCheckpointingStrategy::new(
+                    &AccuracyMetric::<B>::new(),
+                    Aggregate::Mean,
+                    Direction::Highest,
+                    Split::Valid,
+                ))
+                .build(),
+        )
+        .learning_strategy(LearningStrategy::SingleDevice(device.clone()))
         .num_epochs(config.num_epochs)
         .summary()
         .build(
@@ -115,9 +113,33 @@ pub fn train<B: AutodiffBackend>(
                 .unwrap(),
         );
 
-    let model_trained = learner.fit(dataloader_train, dataloader_test);
+    let file = File::create(Path::new(ARTIFACT_DIR).join(STATS_FILE)).unwrap();
+    let mut writer = BufWriter::new(file);
+    encode_into_std_write((mean, std), &mut writer, standard()).unwrap();
+    writer.flush().unwrap();
 
-    model_trained
+    let batcher = AudioBatcher::default();
+
+    let dataloader_train = DataLoaderBuilder::new(batcher.clone())
+        .batch_size(config.batch_size)
+        .shuffle(config.seed)
+        .num_workers(config.num_workers)
+        .build(InMemDataset::new(
+            for_training.iter().flatten().cloned().collect::<Vec<_>>(),
+        ));
+
+    let dataloader_valid = DataLoaderBuilder::new(batcher.clone())
+        .batch_size(config.batch_size)
+        .shuffle(config.seed)
+        .num_workers(config.num_workers)
+        .build(InMemDataset::new(
+            for_validation.iter().flatten().cloned().collect::<Vec<_>>(),
+        ));
+
+    let result = learner.fit(dataloader_train, dataloader_valid);
+
+    result
+        .model
         .save_file(
             Path::new(ARTIFACT_DIR).join("model"),
             &CompactRecorder::new(),
@@ -132,23 +154,21 @@ enum Mode {
 }
 
 #[derive(Deserialize)]
-struct TomlConfig {
+pub struct TomlConfig {
     mode: Mode,
 }
 
-pub fn main() {
-    // BINDGEN_EXTRA_CLANG_ARGS="-I/usr/include/aubio" cargo run --release
-    println!(
-        "{} {} {}",
-        MAX_SAMPLES_N,
-        CROP_PAD,
-        CROP_PAD as f32 / SAMPLE_RATE as f32
-    );
+pub static CONFIG: LazyLock<TomlConfig> = LazyLock::new(|| {
     let data = read_to_string(CONFIG_FILE).unwrap();
 
     let config: TomlConfig = from_str(&data).unwrap();
+    config
+});
 
-    match config.mode {
+pub fn main() {
+    println!("{} {}", CROP_PAD, CROP_PAD as f32 / SAMPLE_RATE as f32);
+
+    match CONFIG.mode {
         Mode::Train => {
             let mut items;
 
@@ -161,14 +181,17 @@ pub fn main() {
                 let file = File::create(CACHE_FILE).unwrap();
                 let mut writer = BufWriter::new(file);
                 encode_into_std_write(&items, &mut writer, standard()).unwrap();
+                writer.flush().unwrap();
             }
 
-            let device = WgpuDevice::default();
+            let device = CudaDevice::default();
 
-            train::<MyAutodiffBackend>(
+            train::<TrainingBackend>(
                 TrainingConfig::new(
                     NetworkConfig::new(),
-                    AdamWConfig::new().with_weight_decay(1e-4),
+                    AdamWConfig::new()
+                        .with_cautious_weight_decay(true)
+                        .with_weight_decay(1e-2),
                 ),
                 &mut items,
                 device,
@@ -177,26 +200,38 @@ pub fn main() {
         Mode::Test => {
             let path = var("MODEL").unwrap();
 
-            let device = WgpuDevice::default();
-            let mut model = NetworkConfig::new().init::<MyAutodiffBackend>(&device);
+            let device = NdArrayDevice::Cpu;
+            let mut model = NetworkConfig::new().init::<TestingBackend>(&device);
 
             model = model
-                .load_file(path, &CompactRecorder::new(), &device)
+                .load_file(&path, &CompactRecorder::new(), &device)
                 .unwrap();
 
-            for audio in read_dir("test").unwrap() {
+            let mut entries: Vec<_> = read_dir("test").unwrap().collect();
+            entries.shuffle(&mut rng());
+
+            let file = File::open(
+                Path::new(&Path::new(&path).components().next().unwrap()).join(STATS_FILE),
+            )
+            .unwrap();
+            let mut reader = BufReader::new(file);
+            let (mean, std) = decode_from_std_read(&mut reader, standard()).unwrap();
+
+            for audio in entries {
                 let audio = audio.unwrap();
                 let audio_path = audio.path();
 
                 let mut frequencies = HashMap::with_capacity(ITERATIONS);
 
                 for _ in 0..ITERATIONS {
-                    let variations = Crop::prepare(&audio_path, true).unwrap();
+                    let mut variations = Crop::prepare(&audio_path).unwrap();
 
-                    for variation in variations {
+                    for variation in &mut variations {
+                        normalize(variation, mean, std);
+
                         let data = TensorData::from(variation.as_slice());
-                        let b = Tensor::<MyAutodiffBackend, 1>::from_floats(data, &device);
-                        let tensor = b.reshape([1, N_COEFFS, N_SEQS]);
+                        let b = Tensor::<TestingBackend, 1>::from_floats(data, &device);
+                        let tensor = b.reshape([1, 1, N_FILTERS, N_FRAMES]);
 
                         let a = model.forward(tensor);
 

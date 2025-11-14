@@ -1,12 +1,13 @@
-use crate::{consts::*, genre::*};
+use crate::{CONFIG, Mode, consts::*, genre::*};
 use rand::{Rng, rng};
 use std::{fs::File, path::PathBuf};
 
-use aubio::{MFCC, PVoc, carr, farr};
 use bincode::{Decode, Encode};
 use biquad::{Biquad, Coefficients, DirectForm2Transposed, Q_BUTTERWORTH_F32, ToHertz, Type};
-// use hound::{SampleFormat, WavSpec, WavWriter};
-use pitch_shift::PitchShifter;
+use hound::{SampleFormat, WavSpec, WavWriter};
+use mel_spec::{mel::MelSpectrogram, stft::Spectrogram};
+use ndarray::Array;
+use signalsmith_stretch::Stretch;
 use symphonia::core::{
     audio::SampleBuffer,
     codecs::{CODEC_TYPE_NULL, DecoderOptions},
@@ -35,7 +36,11 @@ impl Crop {
         &self.genre
     }
 
-    pub fn prepare(source: &PathBuf, testing: bool) -> Option<Vec<Vec<f32>>> {
+    pub fn normalize(&mut self, mean: f32, std: f32) {
+        normalize(&mut self.data, mean, std);
+    }
+
+    pub fn prepare(source: &PathBuf) -> Option<Vec<Vec<f32>>> {
         let src = File::open(source).unwrap();
         let mss = MediaSourceStream::new(Box::new(src), Default::default());
 
@@ -95,7 +100,10 @@ impl Crop {
             }
         }
 
-        assert!(samples.len() >= CROP_PAD);
+        if samples.len() < CROP_PAD {
+            println!("{} skipped.", source.file_name().unwrap().to_str().unwrap());
+            return None;
+        };
 
         let crop_start = rng().random_range(0..samples.len() - CROP_PAD);
         let slice: [f32; CROP_PAD] = samples[crop_start..crop_start + CROP_PAD]
@@ -107,35 +115,37 @@ impl Crop {
         let mut local = slice;
         let mut applied = false;
 
-        if testing {
-            if rng().random_range(0.0..=1.0) < LOFI_CHANCE_TESTING {
-                lofi(&mut local);
-                applied = true;
-            }
+        match CONFIG.mode {
+            Mode::Train => {
+                if rng().random_range(0.0..=1.0) < SIGNALSMITH_CHANCE_TRAINING {
+                    signalsmith(&mut local);
+                    applied = true;
+                }
 
-            if rng().random_range(0.0..=1.0) < PITCH_SHIFT_CHANCE_TESTING {
-                p_shift(&mut local);
-                applied = true;
+                if rng().random_range(0.0..=1.0) < LOFI_CHANCE_TRAINING {
+                    lofi(&mut local);
+                    applied = true;
+                }
             }
-        } else {
-            if rng().random_range(0.0..=1.0) < LOFI_CHANCE_TRAINING {
-                lofi(&mut local);
-                applied = true;
-            }
+            Mode::Test => {
+                if rng().random_range(0.0..=1.0) < SIGNALSMITH_CHANCE_TESTING {
+                    signalsmith(&mut local);
+                    applied = true;
+                }
 
-            if rng().random_range(0.0..=1.0) < PITCH_SHIFT_CHANCE_TRAINING {
-                p_shift(&mut local);
-                applied = true;
+                if rng().random_range(0.0..=1.0) < LOFI_CHANCE_TESTING {
+                    lofi(&mut local);
+                    applied = true;
+                }
             }
         }
 
-        // save_wav(
-        //     source.file_name().unwrap().to_str().unwrap(),
-        //     &local,
-        //     SAMPLE_RATE as u32,
-        // );
-
         if applied {
+            // save_wav(
+            //     source.file_name().unwrap().to_str().unwrap(),
+            //     &local,
+            //     SAMPLE_RATE as u32,
+            // );
             variations.push(process(&local));
         }
 
@@ -145,16 +155,18 @@ impl Crop {
     }
 }
 
-fn p_shift(input: &mut [f32; CROP_PAD]) {
-    let mut shifter = PitchShifter::new(50, SAMPLE_RATE);
-    let mut output = [0.0; CROP_PAD];
-    shifter.shift_pitch(
-        16,
-        rng().random_range(PITCH_SHIFT_RANGE),
-        input,
-        &mut output,
-    );
-    *input = output;
+fn signalsmith(input: &mut [f32; CROP_PAD]) {
+    let mut stretch = Stretch::new(1, 1024, 256);
+    let shift = rng().random_range(PITCH_SHIFT_RANGE);
+    stretch.set_transpose_factor_semitones(shift, None);
+    stretch.set_formant_factor_semitones(-shift, true);
+
+    let output_len = (input.len() as f32 * rng().random_range(SPEED_STRETCH_RANGE)) as usize;
+    let mut output = vec![0.0; output_len];
+
+    stretch.exact(&input, &mut output);
+    output.resize(CROP_PAD, 0.0);
+    input.copy_from_slice(&output);
 }
 
 fn lofi(input: &mut [f32; CROP_PAD]) {
@@ -162,7 +174,7 @@ fn lofi(input: &mut [f32; CROP_PAD]) {
         Coefficients::<f32>::from_params(
             Type::HighPass,
             SAMPLE_RATE.hz(),
-            HIGH_PASS.hz(),
+            rng().random_range(HIGH_PASS_RANGE).hz(),
             Q_BUTTERWORTH_F32,
         )
         .unwrap(),
@@ -172,7 +184,7 @@ fn lofi(input: &mut [f32; CROP_PAD]) {
         Coefficients::<f32>::from_params(
             Type::LowPass,
             SAMPLE_RATE.hz(),
-            LOW_PASS.hz(),
+            rng().random_range(LOW_PASS_RANGE).hz(),
             Q_BUTTERWORTH_F32,
         )
         .unwrap(),
@@ -181,44 +193,71 @@ fn lofi(input: &mut [f32; CROP_PAD]) {
     for sample in input.iter_mut() {
         *sample = hpf.run(*sample);
         *sample = lpf.run(*sample);
-        *sample = sample.clamp(-CLAMP_LEVEL, CLAMP_LEVEL);
-        *sample += rng().random_range(-NOISE_LEVEL..NOISE_LEVEL);
+        *sample += rng().random_range(NOISE_RANGE);
     }
 }
 
-// fn save_wav(path: &str, samples: &[f32], sample_rate: u32) {
-//     let spec = WavSpec {
-//         channels: 1,
-//         sample_rate,
-//         bits_per_sample: 32,
-//         sample_format: SampleFormat::Float,
-//     };
-//     let mut writer = WavWriter::create(path, spec).unwrap();
-//     for &sample in samples {
-//         writer.write_sample(sample).unwrap();
-//     }
-//     writer.finalize().unwrap();
-// }
+fn save_wav(path: &str, samples: &[f32], sample_rate: u32) {
+    let spec = WavSpec {
+        channels: 1,
+        sample_rate,
+        bits_per_sample: 16,
+        sample_format: SampleFormat::Int,
+    };
+    let mut writer = WavWriter::create(path, spec).unwrap();
+    for &sample in samples {
+        writer
+            .write_sample((sample * i16::MAX as f32) as i16)
+            .unwrap();
+    }
+    writer.finalize().unwrap();
+}
 
 fn process(input: &[f32; CROP_PAD]) -> Vec<f32> {
-    assert!(input.len() >= FRAME_SIZE);
+    let mut stft = Spectrogram::new(FRAME_SIZE, HOP_LENGTH);
+    let mut mel = MelSpectrogram::new(FRAME_SIZE, SAMPLE_RATE as f64, N_FILTERS);
 
-    let mut pvoc = PVoc::new(FRAME_SIZE, HOP_LENGTH).unwrap();
-    let mut mfcc = MFCC::new(FRAME_SIZE, N_FILTERS, N_COEFFS, SAMPLE_RATE as u32)
-        .unwrap()
-        .with_mel_coeffs_slaney();
+    let expected_len = N_FILTERS * ((CROP_PAD - FRAME_SIZE) / HOP_LENGTH + 1);
 
-    let mut fftgrain = carr!(FRAME_SIZE);
-    let mut mfcc_out = farr!(N_COEFFS);
-    let mut all_mfccs = Vec::with_capacity(MAX_SAMPLES_N);
-
+    let mut all_mels = Vec::with_capacity(expected_len);
     let rms = (input.iter().map(|x| x.powi(2)).sum::<f32>() / input.len() as f32 + 1e-8).sqrt();
-    for chunk in input.map(|sample| sample / rms).chunks_exact(HOP_LENGTH) {
-        pvoc.do_(chunk, &mut fftgrain).unwrap();
-        mfcc.do_(fftgrain, &mut mfcc_out).unwrap();
-        all_mfccs.extend_from_slice(mfcc_out.as_slice());
+
+    for chunk in input
+        .iter()
+        .map(|&x| x / rms)
+        .collect::<Vec<_>>()
+        .chunks_exact(HOP_LENGTH)
+    {
+        if let Some(fft) = stft.add(chunk) {
+            let mel_frame = mel.add(&fft);
+            all_mels.extend_from_slice(mel_frame.mapv(|x| x as f32).as_slice().unwrap());
+        }
     }
 
-    assert_eq!(all_mfccs.len(), MAX_SAMPLES_N);
-    all_mfccs
+    assert_eq!(all_mels.len(), expected_len);
+
+    all_mels
+}
+
+pub fn compute_global_stats(items: &[Vec<Crop>]) -> (f32, f32) {
+    let mut all_values = Vec::new();
+    for crops in items {
+        for crop in crops {
+            all_values.extend_from_slice(crop.data());
+        }
+    }
+
+    let tensor = Array::from_shape_vec(all_values.len(), all_values).unwrap();
+    let mean = tensor.mean().unwrap();
+    let std = tensor.std(0.0);
+
+    assert!(!mean.is_nan() && !std.is_nan());
+
+    (mean, std)
+}
+
+pub fn normalize(input: &mut [f32], mean: f32, std: f32) {
+    for val in input {
+        *val = (*val - mean) / (std + 1e-8);
+    }
 }
