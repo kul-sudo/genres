@@ -3,4 +3,4 @@
    - `mode = "Test"`
 2. Run `cargo run --release`
 
-Do not forget add the `MODEL` var before testing.
+Do not forget to add the `MODEL` var before testing.
