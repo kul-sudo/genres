@@ -244,9 +244,9 @@ pub fn main() {
                     }
                 }
 
-                let mut freq_vec: Vec<(Genre, u32)> = frequencies.into_iter().collect();
-                freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
-                let top_two = &freq_vec[..freq_vec.len().min(TOP_N)];
+                let mut freq_vec: Vec<_> = frequencies.into_iter().collect();
+                freq_vec.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+                let top_two = &freq_vec[..TOP_N.min(freq_vec.len())];
 
                 println!(
                     "{} {:?}",
