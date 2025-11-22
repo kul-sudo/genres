@@ -1,17 +1,12 @@
-use crate::{
-    audio::*,
-    consts::*,
-    genre::*,
-    layers::noise::{Noise, NoiseConfig},
-};
+use crate::{audio::*, consts::*, genre::*};
 use burn::{
     backend::{Autodiff, Cuda, NdArray},
     config::Config,
     data::dataloader::batcher::Batcher,
     module::Module,
     nn::{
-        Dropout, DropoutConfig, InstanceNorm, InstanceNormConfig, Linear, LinearConfig,
-        PaddingConfig2d,
+        Dropout, DropoutConfig, GaussianNoise, GaussianNoiseConfig, InstanceNorm,
+        InstanceNormConfig, Linear, LinearConfig, PaddingConfig2d,
         conv::{Conv2d, Conv2dConfig},
         loss::CrossEntropyLossConfig,
         pool::{MaxPool2d, MaxPool2dConfig},
@@ -94,7 +89,7 @@ impl<B: Backend> ValidStep<AudioBatch<B>, ClassificationOutput<B>> for Network<B
 
 #[derive(Module, Debug)]
 pub struct Network<B: Backend> {
-    noise1: Noise,
+    noise1: GaussianNoise,
     conv1: Conv2d<B>,
     pool1: MaxPool2d,
     norm1: InstanceNorm<B>,
@@ -114,7 +109,7 @@ pub struct NetworkConfig {}
 impl NetworkConfig {
     pub fn init<B: Backend>(&self, device: &B::Device) -> Network<B> {
         Network {
-            noise1: NoiseConfig::new(0.2).init(),
+            noise1: GaussianNoiseConfig::new(0.2).init(),
             conv1: Conv2dConfig::new([1, 128], [5, 5])
                 .with_padding(PaddingConfig2d::Same)
                 .init(device),

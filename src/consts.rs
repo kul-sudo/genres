@@ -9,6 +9,8 @@ pub const ITERATIONS: usize = 40;
 pub const CONFIG_FILE: &str = "config.toml";
 pub const STATS_FILE: &str = "stats.bin";
 pub const ARTIFACT_DIR: &str = "artifact";
+pub const TEST_DIR: &str = "test";
+pub const MODEL_VAR: &str = "MODEL";
 
 pub const N_FILTERS: usize = 40;
 
@@ -26,6 +28,8 @@ pub const SPEED_STRETCH_RANGE: RangeInclusive<f32> = 0.6..=1.5;
 pub const NOISE_RANGE: RangeInclusive<f32> = -0.002..=0.002;
 pub const HIGH_PASS_RANGE: RangeInclusive<f32> = 80.0..=120.0;
 pub const LOW_PASS_RANGE: RangeInclusive<f32> = 2800.0..=3200.0;
+
+pub const TOP_N: usize = 2;
 
 // Ideally need to be a power of two
 pub const FRAME_SIZE: usize = 2_usize.pow(11);

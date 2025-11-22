@@ -2,7 +2,6 @@ mod audio;
 mod consts;
 mod files;
 mod genre;
-mod layers;
 mod model;
 
 use audio::*;
@@ -102,7 +101,6 @@ pub fn train<B: AutodiffBackend>(
                 ))
                 .build(),
         )
-        .learning_strategy(LearningStrategy::SingleDevice(device.clone()))
         .num_epochs(config.num_epochs)
         .summary()
         .build(
@@ -111,6 +109,7 @@ pub fn train<B: AutodiffBackend>(
             CosineAnnealingLrSchedulerConfig::new(config.learning_rate, total_steps)
                 .init()
                 .unwrap(),
+            LearningStrategy::SingleDevice(device.clone()),
         );
 
     let file = File::create(Path::new(ARTIFACT_DIR).join(STATS_FILE)).unwrap();
@@ -198,7 +197,7 @@ pub fn main() {
             );
         }
         Mode::Test => {
-            let path = var("MODEL").unwrap();
+            let path = var(MODEL_VAR).unwrap();
 
             let device = NdArrayDevice::Cpu;
             let mut model = NetworkConfig::new().init::<TestingBackend>(&device);
@@ -207,7 +206,7 @@ pub fn main() {
                 .load_file(&path, &CompactRecorder::new(), &device)
                 .unwrap();
 
-            let mut entries: Vec<_> = read_dir("test").unwrap().collect();
+            let mut entries: Vec<_> = read_dir(TEST_DIR).unwrap().collect();
             entries.shuffle(&mut rng());
 
             let file = File::open(
@@ -233,10 +232,11 @@ pub fn main() {
                         let b = Tensor::<TestingBackend, 1>::from_floats(data, &device);
                         let tensor = b.reshape([1, 1, N_FILTERS, N_FRAMES]);
 
-                        let a = model.forward(tensor);
+                        let output = model.forward(tensor);
 
-                        let genre_index = a.argmax(1).into_scalar() as u8;
+                        let genre_index = output.argmax(1).into_scalar() as u8;
                         let genre = unsafe { transmute::<u8, Genre>(genre_index) };
+
                         frequencies
                             .entry(genre)
                             .and_modify(|x| *x += 1)
@@ -246,7 +246,7 @@ pub fn main() {
 
                 let mut freq_vec: Vec<(Genre, u32)> = frequencies.into_iter().collect();
                 freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
-                let top_two = &freq_vec[..freq_vec.len().min(2)];
+                let top_two = &freq_vec[..freq_vec.len().min(TOP_N)];
 
                 println!(
                     "{} {:?}",
